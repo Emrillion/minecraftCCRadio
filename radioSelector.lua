@@ -102,7 +102,20 @@ local function handleInput()
       end
     elseif event == "modem_message" then
       local _, side, channel, replyChannel, message, distance = os.pullEvent("modem_message")
-      -- handle message here later
+      if channel == CONTROL_CHANNEL and type(message) == "table" then
+        if message.type == "status_response" then
+          -- update local state
+          queue = message.queue or {}
+          now_playing = message.now_playing or nil
+          server_seq = message.seq or server_seq
+        elseif message.type == "network_shutdown" then
+          print("Core requested shutdown. Shutting down...")
+          os.shutdown()
+        elseif message.type == "network_restart" then
+          print("Core requested restart. Rebooting...")
+          os.reboot()
+        end
+      end
     end
   end
 end
