@@ -1,3 +1,6 @@
+-- THIS IS THE OLD SCRIPT ON THE NEW DEPRECIATED NETWORK
+-- IT CAN BE USED AS A REFERENCE FOR THE ORIGINAL API CALL AND UI
+
 local api_base_url = "https://ipod-2to6magyna-uc.a.run.app/"
 local version = "2.1"
 

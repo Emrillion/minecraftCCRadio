@@ -5,7 +5,8 @@
 -- CONFIG
 local RADIO_CHANNEL = 164
 local CONTROL_CHANNEL = RADIO_CHANNEL + 1
-local api_base_url = "https://ipod-2to6_MAGYNA-uc.a.run.app/"
+--local api_base_url = "https://ipod-2to6_MAGYNA-uc.a.run.app/"
+local api_base_url = "https://ipod-2to6magyna-uc.a.run.app/"
 local version = "2.1"
 local HEARTBEAT_INTERVAL = 1.0
 local CHUNK_SIZE = 16 * 1024 - 4
