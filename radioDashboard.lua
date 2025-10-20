@@ -38,8 +38,16 @@ local function requestStatus()
   local timeout = os.startTimer(2)
   while true do
     local ev, side, channel, reply, msg = os.pullEvent()
-    if ev == "modem_message" and channel == CONTROL_CHANNEL and type(msg) == "table" and msg.type == "status_response" then
-      return msg
+    if ev == "modem_message" and channel == CONTROL_CHANNEL and type(msg) == "table" then
+      if msg.type == "status_response" then
+        return msg
+      elseif msg.type == "network_shutdown" then
+        print("Core requested shutdown. Shutting down...")
+        os.shutdown()
+      elseif msg.type == "network_restart" then
+        print("Core requested restart. Rebooting...")
+        os.reboot()
+      end
     elseif ev == "timer" and reply == timeout then
       return nil, "timeout"
     end

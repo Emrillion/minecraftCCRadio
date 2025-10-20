@@ -188,13 +188,13 @@ local function controlLoop()
         if cmd == "shutdown_network" then
           print("Core: Broadcasting shutdown to all devices...")
           safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, { type = "network_shutdown" })
-          sleep(1.5)
+          sleep(5)
           os.shutdown()
 
         elseif cmd == "restart_network" then
           print("Core: Broadcasting restart to all devices...")
           safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, { type = "network_restart" })
-          sleep(1.5)
+          sleep(5)
           os.reboot()
 
         elseif cmd == "force_refresh" then

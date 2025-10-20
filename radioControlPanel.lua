@@ -1,4 +1,4 @@
--- networkControlPanel.lua
+-- radioControlPanel.lua
 -- External monitor UI for restarting/shutting down the network + force refresh
 -- Self-registers with core and shows core online status
 
@@ -66,7 +66,7 @@ local function announceSelf()
   safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
     type = "join",
     client_id = my_id,
-    client_type = "control_panel"
+    client_type = "control"
   })
 end
 
