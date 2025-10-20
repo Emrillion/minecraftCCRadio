@@ -11,7 +11,6 @@ modem.open(CONTROL_CHANNEL)
 local monitor = peripheral.find("monitor")
 if not monitor then error("Dashboard: No monitor attached") end
 
--- Set monitor text scale for readability
 monitor.setTextScale(0.5)
 local mon = monitor
 
@@ -28,30 +27,27 @@ local function safeTransmit(channel, reply, message)
     modem.transmit(channel, reply, message)
   end)
   if not ok then
-    print("Transmit error:", err)
+    print("Dashboard: Transmit error:", err)
   end
+  return ok
+end
+
+-- Announce ourselves to core
+local function joinNetwork()
+  safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+    type = "join",
+    client_id = my_id,
+    client_type = "dashboard",
+    capabilities = { display = true, control = false }
+  })
 end
 
 -- Request status from the core
 local function requestStatus()
-  safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, { type = "status_request", client_id = my_id })
-  local timeout = os.startTimer(2)
-  while true do
-    local ev, side, channel, reply, msg = os.pullEvent()
-    if ev == "modem_message" and channel == CONTROL_CHANNEL and type(msg) == "table" then
-      if msg.type == "status_response" then
-        return msg
-      elseif msg.type == "network_shutdown" then
-        print("Core requested shutdown. Shutting down...")
-        os.shutdown()
-      elseif msg.type == "network_restart" then
-        print("Core requested restart. Rebooting...")
-        os.reboot()
-      end
-    elseif ev == "timer" and reply == timeout then
-      return nil, "timeout"
-    end
-  end
+  safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+    type = "status_request",
+    client_id = my_id
+  })
 end
 
 -- Utility: pretty centered print
@@ -80,8 +76,10 @@ end
 -- Draw the radio status
 local function drawStatus(s)
   drawBox(" RADIO DASHBOARD ")
+  
   if not s then
-    centerText(5, "No response from core", colors.red)
+    centerText(5, "Waiting for core response...", colors.orange)
+    centerText(7, "ID: " .. my_id, colors.gray)
     return
   end
 
@@ -89,12 +87,24 @@ local function drawStatus(s)
   mon.setCursorPos(2, y)
   mon.setTextColor(colors.lightBlue)
   mon.write("Connected clients: " .. tostring(#s.clients))
+  
   y = y + 1
   mon.setCursorPos(2, y)
-  mon.write("Now playing: " .. (s.now_playing and s.now_playing.name or "(none)"))
+  local np_text = "Now playing: " .. (s.now_playing and s.now_playing.name or "(none)")
+  if #np_text > select(1, mon.getSize()) - 2 then
+    np_text = np_text:sub(1, select(1, mon.getSize()) - 5) .. "..."
+  end
+  mon.write(np_text)
+  
   y = y + 1
   mon.setCursorPos(2, y)
   mon.write("Queue length: " .. tostring(#s.queue))
+  
+  y = y + 1
+  mon.setCursorPos(2, y)
+  mon.setTextColor(colors.gray)
+  mon.write("Uptime: " .. string.format("%.1fs", s.server_uptime or 0))
+  
   y = y + 2
 
   mon.setTextColor(colors.orange)
@@ -107,22 +117,115 @@ local function drawStatus(s)
   y = y + 1
 
   mon.setTextColor(colors.white)
+  local max_y = select(2, mon.getSize()) - 1
   for i = 1, #s.clients do
     local c = s.clients[i]
-    if y >= select(2, mon.getSize()) - 1 then break end -- prevent overflow
+    if y >= max_y then break end
     mon.setCursorPos(2, y)
     mon.write(string.format("%-13s %-8s %-8s %-4s",
       c.client_id:sub(1, 12),
-      c.type or "?",
+      (c.type or "?"):sub(1, 8),
       tostring(c.latency or "?"),
       tostring(c.volume or "?")))
     y = y + 1
   end
+  
+  -- Show last update time
+  mon.setCursorPos(2, max_y)
+  mon.setTextColor(colors.gray)
+  mon.write("Last update: " .. os.date("%H:%M:%S"))
 end
 
--- Main loop
-while true do
-  local status, err = requestStatus()
-  drawStatus(status)
-  sleep(2)
+-- Main loop with proper event handling
+local function mainLoop()
+  local last_status = nil
+  local waiting_for_response = false
+  local request_timer = nil
+  local REFRESH_INTERVAL = 3
+  local TIMEOUT = 5
+  
+  -- Initial join and request
+  joinNetwork()
+  sleep(0.5)
+  requestStatus()
+  waiting_for_response = true
+  request_timer = os.startTimer(TIMEOUT)
+  
+  -- Draw initial UI
+  drawStatus(nil)
+  
+  while true do
+    local event, p1, p2, p3, p4 = os.pullEvent()
+    
+    if event == "modem_message" then
+      local _, side, channel, reply, msg = event, p1, p2, p3, p4
+      
+      if channel == CONTROL_CHANNEL and type(msg) == "table" then
+        if msg.type == "status_response" then
+          last_status = msg
+          waiting_for_response = false
+          if request_timer then
+            os.cancelTimer(request_timer)
+          end
+          drawStatus(last_status)
+          -- Schedule next refresh
+          request_timer = os.startTimer(REFRESH_INTERVAL)
+          
+        elseif msg.type == "join_ack" and msg.client_id == my_id then
+          print("Dashboard: Joined network successfully")
+          
+        elseif msg.type == "heartbeat" then
+          -- Update timestamp without full redraw
+          -- (optional: could update a small section of screen)
+          
+        elseif msg.type == "now_playing_update" then
+          -- Update now playing without waiting for full status
+          if last_status then
+            last_status.now_playing = msg.now_playing
+            drawStatus(last_status)
+          end
+          
+        elseif msg.type == "queue_update" then
+          -- Update queue without waiting for full status
+          if last_status then
+            last_status.queue = msg.queue
+            drawStatus(last_status)
+          end
+          
+        elseif msg.type == "network_shutdown" then
+          mon.setBackgroundColor(colors.red)
+          mon.clear()
+          centerText(math.floor(select(2, mon.getSize()) / 2), "SYSTEM SHUTDOWN", colors.white)
+          sleep(2)
+          os.shutdown()
+          
+        elseif msg.type == "network_restart" then
+          mon.setBackgroundColor(colors.orange)
+          mon.clear()
+          centerText(math.floor(select(2, mon.getSize()) / 2), "SYSTEM RESTART", colors.white)
+          sleep(2)
+          os.reboot()
+        end
+      end
+      
+    elseif event == "timer" and p1 == request_timer then
+      -- Time to refresh or timeout occurred
+      if waiting_for_response then
+        -- Timeout - no response received
+        print("Dashboard: Status request timeout")
+        drawStatus(nil)
+        waiting_for_response = false
+      end
+      
+      -- Request new status
+      requestStatus()
+      waiting_for_response = true
+      request_timer = os.startTimer(TIMEOUT)
+    end
+  end
 end
+
+-- Start
+print("Dashboard: Starting...")
+print("Dashboard: ID:", my_id)
+mainLoop()

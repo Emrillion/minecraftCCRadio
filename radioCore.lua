@@ -5,10 +5,11 @@
 -- CONFIG
 local RADIO_CHANNEL = 164
 local CONTROL_CHANNEL = RADIO_CHANNEL + 1
-local api_base_url = "https://ipod-2to6_MAGYNA-uc.a.run.app/" -- your original API; keep updated
+local api_base_url = "https://ipod-2to6_MAGYNA-uc.a.run.app/"
 local version = "2.1"
-local HEARTBEAT_INTERVAL = 1.0 -- seconds
-local CHUNK_SIZE = 16 * 1024 - 4 -- match original broadcaster chunk size
+local HEARTBEAT_INTERVAL = 1.0
+local CHUNK_SIZE = 16 * 1024 - 4
+local CLIENT_TIMEOUT = 30 -- seconds before considering a client stale
 
 -- PERIPHERALS
 local modem = peripheral.find("modem")
@@ -16,7 +17,7 @@ if not modem then error("Core: No modem attached") end
 modem.open(RADIO_CHANNEL)
 modem.open(CONTROL_CHANNEL)
 
--- Optional local speaker to preview (core may be headless)
+-- Optional local speaker to preview
 local speakers = { peripheral.find("speaker") }
 local has_local_speakers = (#speakers > 0)
 
@@ -25,17 +26,18 @@ local http = http
 local decoder = require("cc.audio.dfpwm").make_decoder()
 
 -- STATE
-local queue = {} -- { { id=..., name=..., artist=..., url=..., volume=..., type=..., ... }, ... }
-local now_playing = nil -- metadata table or nil
+local queue = {}
+local now_playing = nil
 local playing_id = nil
 local player_handle = nil
 local is_loading = false
 local is_error = false
 
-local chunk_index = 0 -- increments each emitted chunk for current song
-local server_seq = 0 -- heartbeat/seq counter
-local clients = {} -- client_id -> {type, last_seen, region, caps, latency, volume, status}
-local client_ids = {} -- useful list order
+local chunk_index = 0
+local server_seq = 0
+local clients = {}
+local shutdown_requested = false
+local restart_requested = false
 
 -- UTIL
 local function gen_client_id(prefix)
@@ -44,11 +46,14 @@ local function gen_client_id(prefix)
 end
 
 local function safeTransmit(channel, reply, message)
-  -- pcall transmit to avoid crashes when modem can't send
   local ok, err = pcall(function()
     modem.transmit(channel, reply, message)
   end)
-  if not ok then print("Transmit error:", err) end
+  if not ok then 
+    print("Core: Transmit error:", err) 
+    return false
+  end
+  return true
 end
 
 local function broadcastHeartbeat()
@@ -60,7 +65,6 @@ local function broadcastHeartbeat()
     server_seq = server_seq,
     timestamp = os.clock()
   }
-  -- send on control channel (so selectors/dashboards get state without audio)
   safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, hb)
 end
 
@@ -74,23 +78,51 @@ local function broadcastChunk(buffer, volume)
     data = buffer,
     volume = volume or 1
   }
-  -- Broadcast raw audio on RADIO_CHANNEL
   safeTransmit(RADIO_CHANNEL, RADIO_CHANNEL, msg)
   chunk_index = chunk_index + 1
 end
 
-local function sendStatusResponse(replyChannel, requester)
+local function buildClientsList()
   local clients_flat = {}
   for id, c in pairs(clients) do
-    table.insert(clients_flat, {client_id = id, type = c.type, last_seen = c.last_seen, region = c.region, latency = c.latency, volume = c.volume, status = c.status})
+    table.insert(clients_flat, {
+      client_id = id,
+      type = c.type,
+      last_seen = c.last_seen,
+      region = c.region,
+      latency = c.latency,
+      volume = c.volume,
+      status = c.status
+    })
   end
+  return clients_flat
+end
+
+local function sendStatusResponse(replyChannel, requester)
   safeTransmit(replyChannel, CONTROL_CHANNEL, {
     type = "status_response",
-    clients = clients_flat,
+    clients = buildClientsList(),
     queue = queue,
     now_playing = now_playing,
     server_uptime = os.clock()
   })
+end
+
+local function pruneStaleClients()
+  local now = os.clock()
+  local removed = 0
+  for id, c in pairs(clients) do
+    local age = now - (c.last_seen or now)
+    if age > CLIENT_TIMEOUT then
+      print("Core: Removing stale client:", id, "(last seen", string.format("%.1f", age), "s ago)")
+      clients[id] = nil
+      removed = removed + 1
+    end
+  end
+  if removed > 0 then
+    print("Core: Pruned", removed, "stale client(s)")
+  end
+  return removed
 end
 
 -- QUEUE MANAGEMENT
@@ -98,25 +130,30 @@ local function setNowPlaying(item)
   now_playing = item
   playing_id = item and item.id or nil
   chunk_index = 0
-  -- close any existing handle
+  
   if player_handle then
     pcall(player_handle.close, player_handle)
     player_handle = nil
   end
+  
   is_loading = true
   is_error = false
   server_seq = server_seq + 1
 
   if now_playing and now_playing.id then
     local dl = api_base_url .. "?v=" .. version .. "&id=" .. textutils.urlEncode(now_playing.id)
-    print("Core: requesting ", dl)
+    print("Core: Requesting", now_playing.name)
     http.request({ url = dl, binary = true })
   else
     is_loading = false
   end
 
-  -- notify selectors via control channel of new now playing
-  safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, { type = "now_playing_update", now_playing = now_playing, playing_id = playing_id, chunk_index = chunk_index })
+  safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+    type = "now_playing_update",
+    now_playing = now_playing,
+    playing_id = playing_id,
+    chunk_index = chunk_index
+  })
 end
 
 local function playNextInQueue()
@@ -130,22 +167,39 @@ local function playNextInQueue()
     is_loading = false
     is_error = false
     player_handle = nil
-    safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, { type = "now_playing_update", now_playing = nil })
+    safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+      type = "now_playing_update",
+      now_playing = nil
+    })
   end
 end
 
--- CONTROL LOOP: handle join/command/ping
+-- CONTROL LOOP
 local function controlLoop()
   while true do
     local ev, side, channel, replyChannel, message, distance = os.pullEvent("modem_message")
+    
     if channel == CONTROL_CHANNEL and type(message) == "table" then
       message._reply = replyChannel
+      
+      -- Update client last_seen timestamp
+      if message.client_id and clients[message.client_id] then
+        clients[message.client_id].last_seen = os.clock()
+      end
+      
       if message.type == "join" then
         local id = message.client_id or gen_client_id("rx")
-        clients[id] = { type = message.client_type or "receiver", last_seen = os.time(), region = message.region, caps = message.capabilities, latency = 0, volume = (message.volume or 1), status = "ok" }
-        clients[id].last_ping = os.clock()
-        print("Core: client join ->", id, message.client_type)
-        -- reply join_ack
+        clients[id] = {
+          type = message.client_type or "receiver",
+          last_seen = os.clock(),
+          region = message.region,
+          caps = message.capabilities,
+          latency = 0,
+          volume = (message.volume or 1),
+          status = "ok"
+        }
+        print("Core: Client joined ->", id, "(" .. (message.client_type or "receiver") .. ")")
+        
         safeTransmit(message._reply, CONTROL_CHANNEL, {
           type = "join_ack",
           client_id = id,
@@ -155,157 +209,206 @@ local function controlLoop()
           queue = queue,
           now_playing = now_playing
         })
+        
       elseif message.type == "command" then
         local cmd = message.cmd
-        print("Core: received command", cmd, "from", message.client_id)
+        print("Core: Command received:", cmd, "from", message.client_id)
+        
         if cmd == "add_to_queue" and message.payload then
           table.insert(queue, message.payload)
-          safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, { type = "queue_update", queue = queue })
+          safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+            type = "queue_update",
+            queue = queue
+          })
+          
         elseif cmd == "play_now" and message.payload then
           setNowPlaying(message.payload)
+          
         elseif cmd == "skip" then
           playNextInQueue()
-        elseif cmd == "set_loop" then
-          -- loop handling could be implemented by storing loop state; omitted for brevity
+          
         elseif cmd == "force_set_volume" and message.payload then
           local vol = message.payload.volume
-          safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, { type = "set_volume", volume = vol, force = true })
+          safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+            type = "set_volume",
+            volume = vol,
+            force = true
+          })
+          
         elseif cmd == "request_status" then
           sendStatusResponse(message._reply, message.client_id)
         end
+        
       elseif message.type == "ping" then
-        -- reply with pong for latency
-        safeTransmit(message._reply, CONTROL_CHANNEL, { type = "pong", seq = message.seq, client_id = message.client_id, ts = os.clock() })
+        safeTransmit(message._reply, CONTROL_CHANNEL, {
+          type = "pong",
+          seq = message.seq,
+          client_id = message.client_id,
+          ts = os.clock()
+        })
+        
+      elseif message.type == "ping_response" then
+        -- Client responded to our ping during force refresh
+        if clients[message.client_id] then
+          clients[message.client_id].last_seen = os.clock()
+          clients[message.client_id].status = "ok"
+        end
+        
       elseif message.type == "resync_request" then
-        -- a client missed chunks; reply with authoritative next chunk info
-        safeTransmit(message._reply, CONTROL_CHANNEL, { type = "resync_response", client_id = message.client_id, song_id = playing_id, next_chunk_index = chunk_index })
+        safeTransmit(message._reply, CONTROL_CHANNEL, {
+          type = "resync_response",
+          client_id = message.client_id,
+          song_id = playing_id,
+          next_chunk_index = chunk_index
+        })
+        
       elseif message.type == "status_request" then
         sendStatusResponse(message._reply, message.client_id)
+        
       elseif message.type == "network_command" then
         local cmd = message.cmd
-        print("Core: Network command received ->", cmd)
+        print("Core: Network command ->", cmd)
 
         if cmd == "shutdown_network" then
           print("Core: Broadcasting shutdown to all devices...")
-          safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, { type = "network_shutdown" })
-          sleep(5)
+          -- Broadcast multiple times to ensure delivery
+          for i = 1, 5 do
+            safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+              type = "network_shutdown",
+              timestamp = os.clock()
+            })
+            sleep(0.5)
+          end
+          print("Core: Shutdown broadcast complete. Shutting down...")
+          sleep(1)
           os.shutdown()
 
         elseif cmd == "restart_network" then
           print("Core: Broadcasting restart to all devices...")
-          safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, { type = "network_restart" })
-          sleep(5)
+          -- Broadcast multiple times to ensure delivery
+          for i = 1, 5 do
+            safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+              type = "network_restart",
+              timestamp = os.clock()
+            })
+            sleep(0.5)
+          end
+          print("Core: Restart broadcast complete. Rebooting...")
+          sleep(1)
           os.reboot()
 
         elseif cmd == "force_refresh" then
-          print("Core: Force refresh requested by control panel!")
-
-          -- Clean up clients not seen recently (60s timeout)
-          local now = os.time()
-          local removed = 0
+          print("Core: Force refresh - pinging all clients...")
+          
+          -- First, prune obviously stale clients
+          pruneStaleClients()
+          
+          -- Ping all remaining clients
+          local ping_seq = os.clock()
           for id, c in pairs(clients) do
-            if (now - (c.last_seen or now)) > 60 then
-              print("Core: Removing stale client:", id)
-              clients[id] = nil
-              removed = removed + 1
-            end
-          end
-          print("Core: Pruned " .. removed .. " stale clients.")
-
-          -- Rebuild flat list
-          local clients_flat = {}
-          for id, c in pairs(clients) do
-            table.insert(clients_flat, {
+            safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+              type = "ping_request",
               client_id = id,
-              type = c.type,
-              last_seen = c.last_seen,
-              region = c.region,
-              latency = c.latency,
-              volume = c.volume,
-              status = c.status
+              seq = ping_seq,
+              timestamp = os.clock()
             })
           end
-
-          -- Broadcast updated status to everyone
+          
+          -- Wait for responses
+          sleep(2)
+          
+          -- Prune again (clients that didn't respond to ping)
+          pruneStaleClients()
+          
+          -- Broadcast updated status
+          print("Core: Broadcasting refreshed status...")
           safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
             type = "status_response",
-            clients = clients_flat,
+            clients = buildClientsList(),
             queue = queue,
             now_playing = now_playing,
-            server_uptime = os.clock()
+            server_uptime = os.clock(),
+            refreshed = true
           })
+          
+          print("Core: Force refresh complete. Active clients:", #buildClientsList())
         end
       end
     end
   end
 end
 
--- HTTP handler: reacts to http_success/failure (mirrors original broadcaster logic)
+-- HTTP LOOP
 local function httpLoop()
   while true do
-    local ev, url, handle = os.pullEvent("http_success")
-    if url and handle then
-      -- if it's the playing download url, set player_handle
-      -- We can't inspect URL reliably here; assume the last requested now_playing corresponds.
+    local ev, url, handle = os.pullEvent()
+    
+    if ev == "http_success" and url and handle then
       player_handle = handle
-      -- read initial 4 bytes
       local start = handle.read(4)
       chunk_index = 0
       is_loading = false
       is_error = false
-      print("Core: download ready")
-    end
-    -- handle failures
-    local ev2, failurl = os.pullEvent("http_failure")
-    if ev2 and failurl then
-      print("Core: http failure", failurl)
+      print("Core: Download ready for", now_playing and now_playing.name or "unknown")
+      
+    elseif ev == "http_failure" then
+      print("Core: HTTP failure for", url)
       is_loading = false
       is_error = true
+      -- Auto-skip on error
+      sleep(2)
+      playNextInQueue()
     end
   end
 end
 
--- AUDIO LOOP: read from player_handle, decode, broadcast
+-- AUDIO LOOP
 local function audioLoop()
   while true do
     if player_handle and now_playing then
-      -- read chunks
       local chunk = player_handle.read(CHUNK_SIZE)
       if not chunk then
-        -- end of file
+        print("Core: Song ended:", now_playing.name)
         player_handle.close()
         player_handle = nil
         playNextInQueue()
       else
         local buffer = decoder(chunk)
-        -- Broadcast the buffer
         broadcastChunk(buffer, now_playing.volume or 1)
 
-        -- Optionally play locally
         if has_local_speakers then
           for _, s in ipairs(speakers) do
-            -- best-effort local playback without blocking the core loop
             pcall(s.playAudio, s, buffer, now_playing.volume or 1)
           end
         end
 
-        -- sleep a small amount if necessary; the rate is determined by how quickly speakers consume audio
-        -- we can let speaker events pace in more complex implementation; keep small yield to avoid lock
         os.sleep(0)
       end
     else
-      os.pullEvent("audio_request") -- idle until new audio ready
+      sleep(0.5)
     end
   end
 end
 
--- Heartbeat loop
+-- HEARTBEAT LOOP
 local function heartbeatLoop()
   while true do
     broadcastHeartbeat()
-    os.sleep(HEARTBEAT_INTERVAL)
+    sleep(HEARTBEAT_INTERVAL)
   end
 end
 
--- Driver: wait for http events and run loops in parallel
-parallel.waitForAny(controlLoop, httpLoop, audioLoop, heartbeatLoop)
+-- MAINTENANCE LOOP
+local function maintenanceLoop()
+  while true do
+    sleep(10)
+    pruneStaleClients()
+  end
+end
+
+-- MAIN
+print("Core: Starting radio core server...")
+print("Core: Radio channel:", RADIO_CHANNEL)
+print("Core: Control channel:", CONTROL_CHANNEL)
+
+parallel.waitForAny(controlLoop, httpLoop, audioLoop, heartbeatLoop, maintenanceLoop)

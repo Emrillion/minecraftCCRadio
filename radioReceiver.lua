@@ -1,119 +1,204 @@
--- radioReceiver.lua (updated)
--- Sync-aware receiver that defers to core for authoritative state. Keeps local volume and optional acceptance of forced volume.
+-- radioReceiver.lua
+-- Sync-aware receiver that defers to core for authoritative state.
 
 local RADIO_CHANNEL = 164
 local CONTROL_CHANNEL = RADIO_CHANNEL + 1
+
 local modem = peripheral.find("modem")
 local decoder = require("cc.audio.dfpwm").make_decoder()
 local speakers = { peripheral.find("speaker") }
+
 if not modem then error("Receiver: No modem found! Attach a wireless modem.") end
 if #speakers == 0 then error("Receiver: No speakers found! Attach at least one speaker.") end
 
 modem.open(RADIO_CHANNEL)
 modem.open(CONTROL_CHANNEL)
 
+-- ==== CLIENT ID ====
 local function gen_client_id(prefix)
   prefix = prefix or "c"
   return prefix .. "_" .. tostring(math.random(1000,9999)) .. "_" .. tostring(os.time() % 100000)
 end
 
 local my_id = gen_client_id("rx")
+
+-- ==== STATE ====
 local expected_song = nil
 local expected_chunk = 0
 local local_volume = 1.0
 local accept_global_force = true
+local last_heartbeat = os.clock()
 
--- Utility helpers (add near the top)
+-- ==== UTILITIES ====
 local function safeTransmit(channel, reply, message)
   local ok, err = pcall(function()
     modem.transmit(channel, reply, message)
   end)
   if not ok then
-    print("Transmit error:", err)
+    print("Receiver: Transmit error:", err)
+    return false
   end
+  return true
 end
 
--- persist volume (optional)
+-- Persist volume
 local function saveConfig()
   local ok, err = pcall(function()
     local f = fs.open("radio_config.txt", "w")
     f.write(textutils.serialize({ volume = local_volume }))
     f.close()
   end)
-end
-local function loadConfig()
-  if fs.exists("radio_config.txt") then
-    local f = fs.open("radio_config.txt", "r")
-    local raw = f.readAll(); f.close()
-    local t = textutils.unserialize(raw)
-    if t and t.volume then local_volume = t.volume end
+  if not ok then
+    print("Receiver: Config save error:", err)
   end
 end
+
+local function loadConfig()
+  if fs.exists("radio_config.txt") then
+    local ok, err = pcall(function()
+      local f = fs.open("radio_config.txt", "r")
+      local raw = f.readAll()
+      f.close()
+      local t = textutils.unserialize(raw)
+      if t and t.volume then
+        local_volume = t.volume
+        print("Receiver: Loaded volume:", local_volume)
+      end
+    end)
+    if not ok then
+      print("Receiver: Config load error:", err)
+    end
+  end
+end
+
 loadConfig()
 
--- join
-safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, { type = "join", client_id = my_id, client_type = "receiver", capabilities = { play = true, control = false, noisy = true }, volume = local_volume })
+-- ==== JOIN NETWORK ====
+print("Receiver: Joining network as", my_id)
+safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+  type = "join",
+  client_id = my_id,
+  client_type = "receiver",
+  capabilities = { play = true, control = false, noisy = true },
+  volume = local_volume
+})
 
+-- ==== CONTROL LOOP ====
 local function handleControl()
   while true do
     local ev, side, channel, reply, msg, dist = os.pullEvent("modem_message")
+    
     if channel == CONTROL_CHANNEL and type(msg) == "table" then
       if msg.type == "join_ack" and msg.client_id == my_id then
         expected_song = msg.song_id
         expected_chunk = msg.next_chunk_index or 0
-        print("Receiver: join ack, will start at chunk", expected_chunk)
+        print("Receiver: Joined! Starting at chunk", expected_chunk)
+        
       elseif msg.type == "heartbeat" then
+        last_heartbeat = os.clock()
+        
+        -- Detect song changes
         if msg.song_id ~= expected_song then
           expected_song = msg.song_id
           expected_chunk = msg.chunk_index
-          -- stop local playback to avoid mismatch
-          for _, s in ipairs(speakers) do pcall(s.stop, s) end
-          print("Receiver: heartbeat - song changed, now expecting chunk", expected_chunk)
+          
+          -- Stop local playback to avoid mismatch
+          for _, s in ipairs(speakers) do
+            pcall(s.stop, s)
+          end
+          
+          print("Receiver: Song changed, expecting chunk", expected_chunk)
         end
+        
+      elseif msg.type == "ping_request" and msg.client_id == my_id then
+        -- Respond to ping during force refresh
+        safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+          type = "ping_response",
+          client_id = my_id,
+          seq = msg.seq,
+          timestamp = os.clock()
+        })
+        
       elseif msg.type == "set_volume" then
         if msg.force or accept_global_force then
           local_volume = msg.volume
           saveConfig()
+          print("Receiver: Volume set to", local_volume)
         end
+        
       elseif msg.type == "resync_response" and msg.client_id == my_id then
         expected_song = msg.song_id
         expected_chunk = msg.next_chunk_index
+        print("Receiver: Resynced to chunk", expected_chunk)
+        
+      elseif msg.type == "now_playing_update" then
+        -- Core notified of song change
+        if msg.now_playing then
+          print("Receiver: Now playing:", msg.now_playing.name)
+        else
+          print("Receiver: Playback stopped")
+        end
+        
       elseif msg.type == "network_shutdown" then
-        print("Core requested shutdown. Shutting down...")
+        print("Receiver: Shutdown command received")
+        for _, s in ipairs(speakers) do
+          pcall(s.stop, s)
+        end
+        sleep(1)
         os.shutdown()
+        
       elseif msg.type == "network_restart" then
-        print("Core requested restart. Rebooting...")
+        print("Receiver: Restart command received")
+        for _, s in ipairs(speakers) do
+          pcall(s.stop, s)
+        end
+        sleep(1)
         os.reboot()
       end
     end
   end
 end
 
+-- ==== AUDIO LOOP ====
 local function handleAudio()
   while true do
     local ev, side, channel, reply, msg, dist = os.pullEvent("modem_message")
+    
     if channel == RADIO_CHANNEL and type(msg) == "table" and msg.type == "audio_chunk" then
+      -- Check if this is the chunk we're expecting
       if msg.song_id == expected_song and msg.chunk_index == expected_chunk then
         expected_chunk = expected_chunk + 1
         local buffer = msg.data
+        
+        -- Play audio on all speakers
         for _, speaker in ipairs(speakers) do
           while not speaker.playAudio(buffer, local_volume) do
             os.pullEvent("speaker_audio_empty")
           end
         end
-      else
-        -- missed chunks? request resync but don't play out-of-order
-        if msg.song_id == expected_song and msg.chunk_index > expected_chunk then
-          safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, { type = "resync_request", client_id = my_id, missing_from = expected_chunk })
-        elseif msg.song_id ~= expected_song and msg.chunk_index == 0 then
-          -- server started a new song, we can jump to it on chunk 0
-          expected_song = msg.song_id
-          expected_chunk = 1
-          local buffer = msg.data
-          for _, speaker in ipairs(speakers) do
-            while not speaker.playAudio(buffer, local_volume) do
-              os.pullEvent("speaker_audio_empty")
-            end
+        
+      elseif msg.song_id == expected_song and msg.chunk_index > expected_chunk then
+        -- We missed chunks - request resync
+        print("Receiver: Missed chunks (expected", expected_chunk, "got", msg.chunk_index, ") - requesting resync")
+        safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+          type = "resync_request",
+          client_id = my_id,
+          missing_from = expected_chunk
+        })
+        
+        -- Skip ahead to avoid further desync
+        expected_chunk = msg.chunk_index + 1
+        
+      elseif msg.song_id ~= expected_song and msg.chunk_index == 0 then
+        -- New song started, jump to it
+        print("Receiver: New song detected, jumping to chunk 0")
+        expected_song = msg.song_id
+        expected_chunk = 1
+        
+        local buffer = msg.data
+        for _, speaker in ipairs(speakers) do
+          while not speaker.playAudio(buffer, local_volume) do
+            os.pullEvent("speaker_audio_empty")
           end
         end
       end
@@ -121,4 +206,31 @@ local function handleAudio()
   end
 end
 
-parallel.waitForAny(handleControl, handleAudio)
+-- ==== WATCHDOG ====
+local function watchdog()
+  while true do
+    sleep(10)
+    local time_since_heartbeat = os.clock() - last_heartbeat
+    
+    if time_since_heartbeat > 15 then
+      print("Receiver: No heartbeat for", string.format("%.1f", time_since_heartbeat), "seconds")
+      print("Receiver: Connection may be lost")
+      
+      -- Try to rejoin
+      safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+        type = "join",
+        client_id = my_id,
+        client_type = "receiver",
+        capabilities = { play = true, control = false, noisy = true },
+        volume = local_volume
+      })
+    end
+  end
+end
+
+-- ==== MAIN ====
+print("Receiver: Starting audio receiver")
+print("Receiver: Volume:", local_volume)
+print("Receiver: Speakers:", #speakers)
+
+parallel.waitForAny(handleControl, handleAudio, watchdog)

@@ -31,6 +31,7 @@ local my_id = gen_client_id("ctrl")
 local core_online = false
 local status_interval = 3
 local status_timer = nil
+local last_status_time = 0
 
 -- ==== BUTTONS ====
 local buttons = {
@@ -59,34 +60,55 @@ local function safeTransmit(channel, reply, message)
   local ok, err = pcall(function()
     modem.transmit(channel, reply, message)
   end)
-  if not ok then print("Transmit error:", err) end
+  if not ok then
+    print("Transmit error:", err)
+    return false
+  end
+  return true
 end
 
 local function announceSelf()
   safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
     type = "join",
     client_id = my_id,
-    client_type = "control"
+    client_type = "control",
+    capabilities = { control = true, display = true }
   })
 end
 
 local function sendNetworkCommand(cmd)
-  safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
-    type = "network_command",
-    cmd = cmd,
-    sender = my_id,
-    timestamp = os.clock()
-  })
+  print("Control Panel: Sending command:", cmd)
+  
+  -- Send command multiple times to ensure delivery
+  for i = 1, 3 do
+    safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+      type = "network_command",
+      cmd = cmd,
+      sender = my_id,
+      timestamp = os.clock()
+    })
+    sleep(0.2)
+  end
+  
   monitor.setCursorPos(1, h)
   monitor.setBackgroundColor(colors.black)
   monitor.setTextColor(colors.yellow)
   monitor.clearLine()
   monitor.write("Sent: " .. cmd)
-  sleep(2)
-  monitor.setCursorPos(1, h)
-  monitor.clearLine()
-  monitor.setTextColor(colors.lightGray)
-  monitor.write("Touch a button to send command.")
+  
+  -- For shutdown/restart, wait for the broadcast from core
+  if cmd == "shutdown_network" or cmd == "restart_network" then
+    monitor.setCursorPos(1, h - 1)
+    monitor.setTextColor(colors.orange)
+    monitor.clearLine()
+    monitor.write("Waiting for core broadcast...")
+  else
+    sleep(2)
+    monitor.setCursorPos(1, h)
+    monitor.clearLine()
+    monitor.setTextColor(colors.lightGray)
+    monitor.write("Touch a button to send command.")
+  end
 end
 
 local function requestStatus()
@@ -110,10 +132,19 @@ local function drawUI()
   if core_online then
     monitor.setBackgroundColor(colors.green)
     monitor.write("   ")
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.green)
+    monitor.setCursorPos(7, 2)
+    monitor.write("ONLINE")
   else
     monitor.setBackgroundColor(colors.red)
     monitor.write("   ")
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.red)
+    monitor.setCursorPos(7, 2)
+    monitor.write("OFFLINE")
   end
+  
   monitor.setBackgroundColor(colors.black)
   monitor.setTextColor(colors.white)
 
@@ -124,57 +155,110 @@ local function drawUI()
   monitor.setCursorPos(1, h)
   monitor.setTextColor(colors.lightGray)
   monitor.write("Touch a button to send command.")
+  
+  -- Show ID
+  monitor.setCursorPos(1, h - 1)
+  monitor.setTextColor(colors.darkGray)
+  monitor.write("ID: " .. my_id:sub(1, 15))
 end
 
 local function inButton(btn, x, y)
   return x >= btn.x and x < btn.x + btn.w and y >= btn.y and y < btn.y + btn.h
 end
 
+-- ==== EVENT HANDLERS ====
+local function handleMonitorTouch(x, y)
+  for name, btn in pairs(buttons) do
+    if inButton(btn, x, y) then
+      drawButton(btn, true)
+      sleep(0.15)
+      drawButton(btn, false)
+      
+      if name == "restart" then
+        sendNetworkCommand("restart_network")
+      elseif name == "shutdown" then
+        sendNetworkCommand("shutdown_network")
+      elseif name == "refresh" then
+        sendNetworkCommand("force_refresh")
+      end
+      
+      break
+    end
+  end
+end
+
+local function handleModemMessage(channel, msg)
+  if channel == CONTROL_CHANNEL and type(msg) == "table" then
+    if msg.type == "status_response" or msg.type == "join_ack" then
+      core_online = true
+      last_status_time = os.clock()
+      drawUI()
+      
+    elseif msg.type == "heartbeat" then
+      core_online = true
+      last_status_time = os.clock()
+      
+    elseif msg.type == "network_shutdown" then
+      print("Control Panel: Received shutdown broadcast from core")
+      monitor.setBackgroundColor(colors.red)
+      monitor.clear()
+      monitor.setTextColor(colors.white)
+      local msg_text = "SHUTTING DOWN"
+      monitor.setCursorPos(math.floor((w - #msg_text) / 2), math.floor(h / 2))
+      monitor.write(msg_text)
+      sleep(2)
+      os.shutdown()
+      
+    elseif msg.type == "network_restart" then
+      print("Control Panel: Received restart broadcast from core")
+      monitor.setBackgroundColor(colors.orange)
+      monitor.clear()
+      monitor.setTextColor(colors.white)
+      local msg_text = "RESTARTING"
+      monitor.setCursorPos(math.floor((w - #msg_text) / 2), math.floor(h / 2))
+      monitor.write(msg_text)
+      sleep(2)
+      os.reboot()
+    end
+  end
+end
+
+local function handleTimer(timer_id)
+  if timer_id == status_timer then
+    requestStatus()
+    
+    -- Check if we've lost connection
+    local time_since_last = os.clock() - last_status_time
+    if time_since_last > (status_interval * 2) then
+      core_online = false
+      drawUI()
+    end
+    
+    status_timer = os.startTimer(status_interval)
+  end
+end
+
 -- ==== MAIN ====
+print("Control Panel: Starting...")
+print("Control Panel: ID:", my_id)
+
 announceSelf()
+sleep(0.5)
 drawUI()
 status_timer = os.startTimer(status_interval)
 
 while true do
   local event, p1, p2, p3, p4, p5 = os.pullEvent()
+  
   if event == "monitor_touch" then
     local _, side, x, y = event, p1, p2, p3
-    for name, btn in pairs(buttons) do
-      if inButton(btn, x, y) then
-        drawButton(btn, true)
-        sleep(0.15)
-        drawButton(btn, false)
-        if name == "restart" then
-          sendNetworkCommand("restart_network")
-        elseif name == "shutdown" then
-          sendNetworkCommand("shutdown_network")
-        elseif name == "refresh" then
-          sendNetworkCommand("force_refresh")
-        end
-      end
-    end
+    handleMonitorTouch(x, y)
 
   elseif event == "modem_message" then
     local _, side, channel, reply, msg = event, p1, p2, p3, p4
-    if channel == CONTROL_CHANNEL and type(msg) == "table" then
-      if msg.type == "status_response" then
-        core_online = true
-        drawUI()
-      elseif msg.type == "network_shutdown" then
-        print("Core requested shutdown. Shutting down...")
-        os.shutdown()
-      elseif msg.type == "network_restart" then
-        print("Core requested restart. Rebooting...")
-        os.reboot()
-      end
-    end
+    handleModemMessage(channel, msg)
 
   elseif event == "timer" then
-    if p1 == status_timer then
-      requestStatus()
-      core_online = false
-      drawUI()
-      status_timer = os.startTimer(status_interval)
-    end
+    handleTimer(p1)
   end
 end
