@@ -1,3 +1,6 @@
+-- THIS IS THE OLD SCRIPT FROM THE NOW DEPRECIATED NETWORK
+-- SPECIFICALLY THE RECIEVER PORTION THAT WAS THE ORIRINAL INNITAL CHANGE
+
 -- Radio Receiver Script for CC: Retweaked
 local RADIO_CHANNEL = 64  -- Must match broadcaster
 local modem = peripheral.find("modem")
