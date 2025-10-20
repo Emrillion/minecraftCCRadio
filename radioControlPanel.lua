@@ -160,6 +160,12 @@ while true do
       if msg.type == "status_response" then
         core_online = true
         drawUI()
+      elseif msg.type == "network_shutdown" then
+        print("Core requested shutdown. Shutting down...")
+        os.shutdown()
+      elseif msg.type == "network_restart" then
+        print("Core requested restart. Rebooting...")
+        os.reboot()
       end
     end
 

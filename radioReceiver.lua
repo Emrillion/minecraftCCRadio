@@ -78,6 +78,12 @@ local function handleControl()
       elseif msg.type == "resync_response" and msg.client_id == my_id then
         expected_song = msg.song_id
         expected_chunk = msg.next_chunk_index
+      elseif msg.type == "network_shutdown" then
+        print("Core requested shutdown. Shutting down...")
+        os.shutdown()
+      elseif msg.type == "network_restart" then
+        print("Core requested restart. Rebooting...")
+        os.reboot()
       end
     end
   end

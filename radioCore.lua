@@ -181,6 +181,60 @@ local function controlLoop()
         safeTransmit(message._reply, CONTROL_CHANNEL, { type = "resync_response", client_id = message.client_id, song_id = playing_id, next_chunk_index = chunk_index })
       elseif message.type == "status_request" then
         sendStatusResponse(message._reply, message.client_id)
+      elseif message.type == "network_command" then
+        local cmd = message.cmd
+        print("Core: Network command received ->", cmd)
+
+        if cmd == "shutdown_network" then
+          print("Core: Broadcasting shutdown to all devices...")
+          safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, { type = "network_shutdown" })
+          sleep(1.5)
+          os.shutdown()
+
+        elseif cmd == "restart_network" then
+          print("Core: Broadcasting restart to all devices...")
+          safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, { type = "network_restart" })
+          sleep(1.5)
+          os.reboot()
+
+        elseif cmd == "force_refresh" then
+          print("Core: Force refresh requested by control panel!")
+
+          -- Clean up clients not seen recently (60s timeout)
+          local now = os.time()
+          local removed = 0
+          for id, c in pairs(clients) do
+            if (now - (c.last_seen or now)) > 60 then
+              print("Core: Removing stale client:", id)
+              clients[id] = nil
+              removed = removed + 1
+            end
+          end
+          print("Core: Pruned " .. removed .. " stale clients.")
+
+          -- Rebuild flat list
+          local clients_flat = {}
+          for id, c in pairs(clients) do
+            table.insert(clients_flat, {
+              client_id = id,
+              type = c.type,
+              last_seen = c.last_seen,
+              region = c.region,
+              latency = c.latency,
+              volume = c.volume,
+              status = c.status
+            })
+          end
+
+          -- Broadcast updated status to everyone
+          safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+            type = "status_response",
+            clients = clients_flat,
+            queue = queue,
+            now_playing = now_playing,
+            server_uptime = os.clock()
+          })
+        end
       end
     end
   end
