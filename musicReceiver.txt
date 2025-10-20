@@ -1,0 +1,30 @@
+-- Radio Receiver Script for CC: Retweaked
+local RADIO_CHANNEL = 64  -- Must match broadcaster
+local modem = peripheral.find("modem")
+local decoder = require("cc.audio.dfpwm").make_decoder()
+local speakers = { peripheral.find("speaker") }
+
+if not modem then
+    error("No modem found! Attach a wireless modem.")
+end
+if #speakers == 0 then
+    error("No speakers found! Attach at least one speaker.")
+end
+
+modem.open(RADIO_CHANNEL)
+
+print("Radio receiver online, listening on channel " .. RADIO_CHANNEL)
+
+while true do
+    local event, side, channel, replyChannel, message, distance = os.pullEvent("modem_message")
+    if channel == RADIO_CHANNEL and type(message) == "table" and message.type == "audio_chunk" then
+        local buffer = message.data
+        local vol = message.volume or 1
+        for _, speaker in ipairs(speakers) do
+            -- Wait until speaker is ready
+            while not speaker.playAudio(buffer, vol) do
+                os.pullEvent("speaker_audio_empty")
+            end
+        end
+    end
+end
