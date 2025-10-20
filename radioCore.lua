@@ -9,7 +9,8 @@ local api_base_url = "https://ipod-2to6_MAGYNA-uc.a.run.app/"
 local version = "2.1"
 local HEARTBEAT_INTERVAL = 1.0
 local CHUNK_SIZE = 16 * 1024 - 4
-local CLIENT_TIMEOUT = 30 -- seconds before considering a client stale
+local CLIENT_TIMEOUT = 120 -- seconds before considering a client stale (2 minutes)
+local MAINTENANCE_INTERVAL = 30 -- how often to check for stale clients (30 seconds)
 
 -- PERIPHERALS
 local modem = peripheral.find("modem")
@@ -111,17 +112,30 @@ end
 local function pruneStaleClients()
   local now = os.clock()
   local removed = 0
+  local checked = 0
+  
   for id, c in pairs(clients) do
+    checked = checked + 1
     local age = now - (c.last_seen or now)
+    
     if age > CLIENT_TIMEOUT then
-      print("Core: Removing stale client:", id, "(last seen", string.format("%.1f", age), "s ago)")
-      clients[id] = nil
-      removed = removed + 1
+      -- Client hasn't been seen in a while - try pinging first
+      print("Core: Client", id, "hasn't been seen for", string.format("%.1f", age), "s - pinging...")
+      
+      safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+        type = "ping_request",
+        client_id = id,
+        seq = now,
+        timestamp = now
+      })
+      
+      -- Mark as potentially stale, but don't remove yet
+      -- Force refresh will do the actual removal
+      c.status = "unresponsive"
     end
   end
-  if removed > 0 then
-    print("Core: Pruned", removed, "stale client(s)")
-  end
+  
+  print("Core: Maintenance check - examined", checked, "clients")
   return removed
 end
 
@@ -248,10 +262,11 @@ local function controlLoop()
         })
         
       elseif message.type == "ping_response" then
-        -- Client responded to our ping during force refresh
+        -- Client responded to our ping during maintenance or force refresh
         if clients[message.client_id] then
           clients[message.client_id].last_seen = os.clock()
           clients[message.client_id].status = "ok"
+          print("Core: Client", message.client_id, "responded to ping")
         end
         
       elseif message.type == "resync_request" then
@@ -298,14 +313,13 @@ local function controlLoop()
           os.reboot()
 
         elseif cmd == "force_refresh" then
-          print("Core: Force refresh - pinging all clients...")
+          print("Core: Force refresh - pinging all clients and removing unresponsive ones...")
           
-          -- First, prune obviously stale clients
-          pruneStaleClients()
-          
-          -- Ping all remaining clients
+          -- Ping all clients
           local ping_seq = os.clock()
+          local client_count = 0
           for id, c in pairs(clients) do
+            client_count = client_count + 1
             safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
               type = "ping_request",
               client_id = id,
@@ -314,11 +328,25 @@ local function controlLoop()
             })
           end
           
-          -- Wait for responses
-          sleep(2)
+          print("Core: Pinged", client_count, "clients, waiting for responses...")
           
-          -- Prune again (clients that didn't respond to ping)
-          pruneStaleClients()
+          -- Wait for responses
+          sleep(3)
+          
+          -- Now remove clients that are marked unresponsive or very old
+          local now = os.clock()
+          local removed = 0
+          for id, c in pairs(clients) do
+            local age = now - (c.last_seen or now)
+            -- Remove if status is unresponsive OR if it's been over 3 minutes
+            if c.status == "unresponsive" or age > 180 then
+              print("Core: Removing unresponsive client:", id, "(last seen", string.format("%.1f", age), "s ago)")
+              clients[id] = nil
+              removed = removed + 1
+            end
+          end
+          
+          print("Core: Force refresh removed", removed, "unresponsive client(s)")
           
           -- Broadcast updated status
           print("Core: Broadcasting refreshed status...")
@@ -401,7 +429,7 @@ end
 -- MAINTENANCE LOOP
 local function maintenanceLoop()
   while true do
-    sleep(10)
+    sleep(MAINTENANCE_INTERVAL)
     pruneStaleClients()
   end
 end

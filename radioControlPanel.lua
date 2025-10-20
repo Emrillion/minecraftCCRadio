@@ -157,9 +157,11 @@ local function drawUI()
   monitor.write("Touch a button to send command.")
   
   -- Show ID
-  monitor.setCursorPos(1, h - 1)
-  monitor.setTextColor(colors.darkGray)
-  monitor.write("ID: " .. my_id:sub(1, 15))
+  if h and h > 2 then
+    monitor.setCursorPos(1, h - 1)
+    monitor.setTextColor(colors.gray)
+    monitor.write("ID: " .. my_id:sub(1, 15))
+  end
 end
 
 local function inButton(btn, x, y)

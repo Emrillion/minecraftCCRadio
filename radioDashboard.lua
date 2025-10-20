@@ -141,6 +141,7 @@ local function mainLoop()
   local last_status = nil
   local waiting_for_response = false
   local request_timer = nil
+  local last_update_time = os.clock()
   local REFRESH_INTERVAL = 3
   local TIMEOUT = 5
   
@@ -152,7 +153,7 @@ local function mainLoop()
   request_timer = os.startTimer(TIMEOUT)
   
   -- Draw initial UI
-  drawStatus(nil)
+  drawStatus(nil, last_update_time)
   
   while true do
     local event, p1, p2, p3, p4 = os.pullEvent()
@@ -163,11 +164,12 @@ local function mainLoop()
       if channel == CONTROL_CHANNEL and type(msg) == "table" then
         if msg.type == "status_response" then
           last_status = msg
+          last_update_time = os.clock()
           waiting_for_response = false
           if request_timer then
             os.cancelTimer(request_timer)
           end
-          drawStatus(last_status)
+          drawStatus(last_status, last_update_time)
           -- Schedule next refresh
           request_timer = os.startTimer(REFRESH_INTERVAL)
           
@@ -182,14 +184,16 @@ local function mainLoop()
           -- Update now playing without waiting for full status
           if last_status then
             last_status.now_playing = msg.now_playing
-            drawStatus(last_status)
+            last_update_time = os.clock()
+            drawStatus(last_status, last_update_time)
           end
           
         elseif msg.type == "queue_update" then
           -- Update queue without waiting for full status
           if last_status then
             last_status.queue = msg.queue
-            drawStatus(last_status)
+            last_update_time = os.clock()
+            drawStatus(last_status, last_update_time)
           end
           
         elseif msg.type == "network_shutdown" then
@@ -213,8 +217,13 @@ local function mainLoop()
       if waiting_for_response then
         -- Timeout - no response received
         print("Dashboard: Status request timeout")
-        drawStatus(nil)
+        drawStatus(nil, last_update_time)
         waiting_for_response = false
+      end
+      
+      -- Redraw with updated "seconds ago" even if no new data
+      if last_status and not waiting_for_response then
+        drawStatus(last_status, last_update_time)
       end
       
       -- Request new status
