@@ -14,12 +14,30 @@ if not monitor then error("Dashboard: No monitor attached") end
 monitor.setTextScale(0.5)
 local mon = monitor
 
--- Generate unique client ID
+-- Generate unique client ID (but try to reuse if we have one saved)
 local function gen_client_id(prefix)
   prefix = prefix or "c"
   return prefix .. "_" .. tostring(math.random(1000,9999)) .. "_" .. tostring(os.time() % 100000)
 end
-local my_id = gen_client_id("dash")
+
+local function loadOrCreateClientId()
+  if fs.exists(".dashboard_id") then
+    local f = fs.open(".dashboard_id", "r")
+    local id = f.readAll()
+    f.close()
+    print("Dashboard: Reusing ID:", id)
+    return id
+  else
+    local id = gen_client_id("dash")
+    local f = fs.open(".dashboard_id", "w")
+    f.write(id)
+    f.close()
+    print("Dashboard: Created new ID:", id)
+    return id
+  end
+end
+
+local my_id = loadOrCreateClientId()
 
 -- Utility: safe transmit
 local function safeTransmit(channel, reply, message)
@@ -221,8 +239,8 @@ local function mainLoop()
         waiting_for_response = false
       end
       
-      -- Redraw with updated "seconds ago" even if no new data
-      if last_status and not waiting_for_response then
+      -- Redraw to update "seconds ago" counter
+      if last_status then
         drawStatus(last_status, last_update_time)
       end
       
