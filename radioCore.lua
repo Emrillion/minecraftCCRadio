@@ -209,6 +209,15 @@ local function controlLoop()
           now_playing = now_playing
         })
         
+      elseif message.type == "playback_complete" then
+        -- Pacer finished playing the current song
+        print("Core: Pacer reports playback complete for", message.song_id)
+        if message.song_id == playing_id then
+          print("Core: Moving to next song in queue")
+          -- Don't need to close player_handle - already closed by audioLoop
+          playNextInQueue()
+        end
+        
       elseif message.type == "command" then
         local cmd = message.cmd
         print("Core: Command received:", cmd, "from", message.client_id)
@@ -365,7 +374,7 @@ local function httpLoop()
   end
 end
 
--- AUDIO LOOP - Now sends chunks as fast as possible
+-- AUDIO LOOP - Sends chunks as fast as possible, pacer notifies when done
 local function audioLoop()
   local chunks_sent = 0
   local start_time = nil
@@ -380,19 +389,23 @@ local function audioLoop()
       local chunk = player_handle.read(CHUNK_SIZE)
       if not chunk then
         local elapsed = os.clock() - start_time
-        print(string.format("Core: Song complete - sent %d chunks in %.2fs", chunks_sent, elapsed))
-        print("Core: Song ended:", now_playing.name)
+        print(string.format("Core: Transmission complete - sent %d chunks in %.2fs", chunks_sent, elapsed))
+        print("Core: Waiting for pacer to finish playback...")
+        
+        -- Close the handle, but DON'T move to next song yet
+        -- Wait for pacer to send "playback_complete" message
         player_handle.close()
         player_handle = nil
         chunks_sent = 0
-        playNextInQueue()
+        
+        -- Just wait - the controlLoop will handle playback_complete
+        sleep(0.5)
       else
         local buffer = decoder(chunk)
         broadcastChunk(buffer, now_playing.volume or 1)
         chunks_sent = chunks_sent + 1
         
         -- No delay - send as fast as possible!
-        -- The pacer will handle throttling
         os.sleep(0)
       end
     else

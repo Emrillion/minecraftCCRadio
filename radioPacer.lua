@@ -319,11 +319,36 @@ local function playbackLoop()
         sleep(0.3)
       end
       
-      -- Check if we're running low on buffer
+      -- Check if we're running low on buffer AND still receiving
       if buffer_size < 2 and playing then
-        print("Pacer: Buffer low (" .. buffer_size .. "), waiting for more chunks...")
-        playing = false
-        drawMonitor()
+        -- Check if we've received all chunks (no new chunks for a bit means song is done sending)
+        local last_received = chunks_received
+        sleep(1)
+        
+        if last_received == chunks_received and buffer_size == 0 then
+          -- No new chunks came in and buffer is empty - song playback complete!
+          print("Pacer: Playback complete for song", current_song_id)
+          
+          -- Notify core that this song finished playing
+          safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+            type = "playback_complete",
+            song_id = current_song_id,
+            chunks_played = chunks_sent,
+            client_id = my_id
+          })
+          
+          playing = false
+          current_song_id = nil
+          current_song_name = "(none)"
+          chunks_received = 0
+          chunks_sent = 0
+          last_chunk_sent = 0
+          drawMonitor()
+        elseif buffer_size < 2 then
+          print("Pacer: Buffer low (" .. buffer_size .. "), waiting for more chunks...")
+          playing = false
+          drawMonitor()
+        end
       end
       
     else
