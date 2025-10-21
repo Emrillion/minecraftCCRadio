@@ -179,27 +179,41 @@ local function handleAudio()
         end
         
       elseif msg.song_id == expected_song and msg.chunk_index > expected_chunk then
-        -- We missed chunks - request resync
-        print("Receiver: Missed chunks (expected", expected_chunk, "got", msg.chunk_index, ") - requesting resync")
-        safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
-          type = "resync_request",
-          client_id = my_id,
-          missing_from = expected_chunk
-        })
+        -- We missed chunks, but don't stop playing!
+        -- Just skip ahead and continue from where the pacer is
+        print("Receiver: Missed chunks (expected", expected_chunk, "got", msg.chunk_index, ") - catching up")
         
-        -- Skip ahead to avoid further desync
         expected_chunk = msg.chunk_index + 1
         
-      elseif msg.song_id ~= expected_song and msg.chunk_index == 0 then
-        -- New song started, jump to it
-        print("Receiver: New song detected, jumping to chunk 0")
-        expected_song = msg.song_id
-        expected_chunk = 1
-        
+        -- Play this chunk anyway to stay in sync
         local buffer = msg.data
         for _, speaker in ipairs(speakers) do
-          while not speaker.playAudio(buffer, local_volume) do
-            os.pullEvent("speaker_audio_empty")
+          -- Use pcall in case speakers are busy
+          pcall(speaker.playAudio, speaker, buffer, local_volume)
+        end
+        
+      elseif msg.song_id ~= expected_song then
+        -- New song started
+        if msg.chunk_index == 0 then
+          print("Receiver: New song detected, jumping to chunk 0")
+          expected_song = msg.song_id
+          expected_chunk = 1
+          
+          local buffer = msg.data
+          for _, speaker in ipairs(speakers) do
+            while not speaker.playAudio(buffer, local_volume) do
+              os.pullEvent("speaker_audio_empty")
+            end
+          end
+        else
+          -- New song but not at chunk 0 - we missed the start, catch up
+          print("Receiver: New song detected mid-stream at chunk", msg.chunk_index)
+          expected_song = msg.song_id
+          expected_chunk = msg.chunk_index + 1
+          
+          local buffer = msg.data
+          for _, speaker in ipairs(speakers) do
+            pcall(speaker.playAudio, speaker, buffer, local_volume)
           end
         end
       end

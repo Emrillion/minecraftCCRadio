@@ -35,6 +35,7 @@ local buffer_size = 0
 local chunks_received = 0
 local chunks_sent = 0
 local last_chunk_sent = 0
+local transmission_complete = false  -- NEW: tracks if core finished sending
 
 -- CLIENT ID
 local function gen_client_id(prefix)
@@ -59,6 +60,7 @@ end
 local function clearBuffer()
   chunk_buffer = {}
   buffer_size = 0
+  transmission_complete = false
   print("Pacer: Buffer cleared")
 end
 
@@ -172,6 +174,8 @@ safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
 
 -- RECEIVE CHUNKS FROM CORE
 local function receiveLoop()
+  local last_chunk_time = os.clock()
+  
   while true do
     local ev, side, channel, reply, msg, dist = os.pullEvent("modem_message")
     
@@ -186,6 +190,10 @@ local function receiveLoop()
           chunks_sent = 0
           last_chunk_sent = 0
         end
+        
+        -- Update last chunk time
+        last_chunk_time = os.clock()
+        transmission_complete = false
         
         -- Buffer the chunk
         table.insert(chunk_buffer, {
@@ -235,10 +243,20 @@ local function receiveLoop()
           drawMonitor()
         end
         
+        -- Check if we haven't received chunks in a while and should mark transmission complete
+        if playing and current_song_id and (os.clock() - last_chunk_time) > 3 then
+          if not transmission_complete then
+            print("Pacer: No new chunks for 3s - transmission appears complete")
+            transmission_complete = true
+            os.queueEvent("pacer_check_complete")
+          end
+        end
+        
       elseif msg.type == "now_playing_update" then
         if msg.now_playing then
           print("Pacer: Now playing:", msg.now_playing.name)
           current_song_name = msg.now_playing.name or "(unknown)"
+          last_chunk_time = os.clock()
         else
           print("Pacer: Playback stopped")
           clearBuffer()
@@ -250,12 +268,30 @@ local function receiveLoop()
         
       elseif msg.type == "network_shutdown" then
         print("Pacer: Shutdown command received")
-        sleep(1)
+        if has_monitor then
+          monitor.setBackgroundColor(colors.red)
+          monitor.clear()
+          local w, h = monitor.getSize()
+          monitor.setTextColor(colors.white)
+          local msg_text = "SYSTEM SHUTDOWN"
+          monitor.setCursorPos(math.floor((w - #msg_text) / 2) + 1, math.floor(h / 2))
+          monitor.write(msg_text)
+        end
+        sleep(2)
         os.shutdown()
         
       elseif msg.type == "network_restart" then
         print("Pacer: Restart command received")
-        sleep(1)
+        if has_monitor then
+          monitor.setBackgroundColor(colors.orange)
+          monitor.clear()
+          local w, h = monitor.getSize()
+          monitor.setTextColor(colors.white)
+          local msg_text = "SYSTEM RESTART"
+          monitor.setCursorPos(math.floor((w - #msg_text) / 2) + 1, math.floor(h / 2))
+          monitor.write(msg_text)
+        end
+        sleep(2)
         os.reboot()
       end
     end
@@ -265,6 +301,35 @@ end
 -- PLAYBACK LOOP - Sends chunks at proper rate
 local function playbackLoop()
   while true do
+    local event = os.pullEvent()
+    
+    if event == "pacer_start_playback" then
+      playing = true
+      drawMonitor()
+    elseif event == "pacer_check_complete" then
+      -- Check if buffer is empty and transmission is complete
+      if transmission_complete and buffer_size == 0 and playing then
+        print("Pacer: Playback complete for song", current_song_id)
+        
+        -- Notify core that this song finished playing
+        safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+          type = "playback_complete",
+          song_id = current_song_id,
+          chunks_played = chunks_sent,
+          client_id = my_id
+        })
+        
+        playing = false
+        current_song_id = nil
+        current_song_name = "(none)"
+        chunks_received = 0
+        chunks_sent = 0
+        last_chunk_sent = 0
+        transmission_complete = false
+        drawMonitor()
+      end
+    end
+    
     if playing and #chunk_buffer > 0 then
       local chunk_data = table.remove(chunk_buffer, 1)
       buffer_size = #chunk_buffer
@@ -295,67 +360,72 @@ local function playbackLoop()
       end
       
       -- CRITICAL: Wait for audio to play before sending next chunk
-      -- Each chunk is ~6KB of DFPWM audio at 48kHz = ~1 second of audio
-      -- We wait for speaker_audio_empty to know when to send next chunk
       if has_local_speaker then
         local timeout = os.startTimer(2)
         while true do
-          local event, param = os.pullEvent()
-          if event == "speaker_audio_empty" then
+          local ev, param = os.pullEvent()
+          if ev == "speaker_audio_empty" then
             os.cancelTimer(timeout)
             break
-          elseif event == "timer" and param == timeout then
-            -- Timeout fallback - continue anyway
+          elseif ev == "timer" and param == timeout then
             break
-          elseif event == "pacer_stop_playback" then
+          elseif ev == "pacer_stop_playback" then
             os.cancelTimer(timeout)
             return
+          elseif ev == "pacer_check_complete" then
+            -- Handle completion check even during playback
+            os.cancelTimer(timeout)
+            if transmission_complete and buffer_size == 0 then
+              print("Pacer: Playback complete for song", current_song_id)
+              
+              safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+                type = "playback_complete",
+                song_id = current_song_id,
+                chunks_played = chunks_sent,
+                client_id = my_id
+              })
+              
+              playing = false
+              current_song_id = nil
+              current_song_name = "(none)"
+              chunks_received = 0
+              chunks_sent = 0
+              last_chunk_sent = 0
+              transmission_complete = false
+              drawMonitor()
+              return
+            end
+            break
           end
         end
       else
-        -- No local speaker - use fixed delay (less accurate but works)
-        -- DFPWM at 48kHz: 6KB = 48000/8 = 6000 samples = 0.125 seconds
-        -- 16KB chunk = ~0.33 seconds, but add buffer time
+        -- No local speaker - use fixed delay
         sleep(0.3)
       end
       
-      -- Check if we're running low on buffer AND still receiving
-      if buffer_size < 2 and playing then
-        -- Check if we've received all chunks (no new chunks for a bit means song is done sending)
-        local last_received = chunks_received
-        sleep(1)
+      -- After playing this chunk, check if we're done
+      if transmission_complete and buffer_size == 0 then
+        print("Pacer: Playback complete for song", current_song_id)
         
-        if last_received == chunks_received and buffer_size == 0 then
-          -- No new chunks came in and buffer is empty - song playback complete!
-          print("Pacer: Playback complete for song", current_song_id)
-          
-          -- Notify core that this song finished playing
-          safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
-            type = "playback_complete",
-            song_id = current_song_id,
-            chunks_played = chunks_sent,
-            client_id = my_id
-          })
-          
-          playing = false
-          current_song_id = nil
-          current_song_name = "(none)"
-          chunks_received = 0
-          chunks_sent = 0
-          last_chunk_sent = 0
-          drawMonitor()
-        elseif buffer_size < 2 then
-          print("Pacer: Buffer low (" .. buffer_size .. "), waiting for more chunks...")
-          playing = false
-          drawMonitor()
-        end
-      end
-      
-    else
-      -- Wait for signal to start playing
-      local event = os.pullEvent()
-      if event == "pacer_start_playback" then
-        playing = true
+        safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+          type = "playback_complete",
+          song_id = current_song_id,
+          chunks_played = chunks_sent,
+          client_id = my_id
+        })
+        
+        playing = false
+        current_song_id = nil
+        current_song_name = "(none)"
+        chunks_received = 0
+        chunks_sent = 0
+        last_chunk_sent = 0
+        transmission_complete = false
+        drawMonitor()
+      elseif buffer_size < 2 and not transmission_complete then
+        -- Buffer low but transmission not complete - wait for more
+        print("Pacer: Buffer low (" .. buffer_size .. "), waiting for more chunks...")
+        playing = false
         drawMonitor()
       end
     end
