@@ -28,6 +28,8 @@ local expected_chunk = 0
 local local_volume = 1.0
 local accept_global_force = true
 local last_heartbeat = os.clock()
+local chunk_buffer = {}  -- Small local buffer
+local BUFFER_SIZE = 2  -- Keep 2 chunks buffered
 
 -- ==== UTILITIES ====
 local function safeTransmit(channel, reply, message)
@@ -166,57 +168,67 @@ local function handleAudio()
     
     -- NOW listening on RECEIVER_CHANNEL (166) from pacer
     if channel == RECEIVER_CHANNEL and type(msg) == "table" and msg.type == "audio_chunk" then
-      -- Check if this is the chunk we're expecting
-      if msg.song_id == expected_song and msg.chunk_index == expected_chunk then
-        expected_chunk = expected_chunk + 1
-        local buffer = msg.data
+      
+      -- Handle song changes
+      if msg.song_id ~= expected_song then
+        print("Receiver: New song detected")
+        expected_song = msg.song_id
+        expected_chunk = 0
+        chunk_buffer = {}
         
-        -- Play audio on all speakers
-        for _, speaker in ipairs(speakers) do
-          while not speaker.playAudio(buffer, local_volume) do
-            os.pullEvent("speaker_audio_empty")
-          end
-        end
-        
-      elseif msg.song_id == expected_song and msg.chunk_index > expected_chunk then
-        -- We missed chunks, but don't stop playing!
-        -- Just skip ahead and continue from where the pacer is
-        print("Receiver: Missed chunks (expected", expected_chunk, "got", msg.chunk_index, ") - catching up")
-        
-        expected_chunk = msg.chunk_index + 1
-        
-        -- Play this chunk anyway to stay in sync
-        local buffer = msg.data
-        for _, speaker in ipairs(speakers) do
-          -- Use pcall in case speakers are busy
-          pcall(speaker.playAudio, speaker, buffer, local_volume)
-        end
-        
-      elseif msg.song_id ~= expected_song then
-        -- New song started
-        if msg.chunk_index == 0 then
-          print("Receiver: New song detected, jumping to chunk 0")
-          expected_song = msg.song_id
-          expected_chunk = 1
-          
-          local buffer = msg.data
-          for _, speaker in ipairs(speakers) do
-            while not speaker.playAudio(buffer, local_volume) do
-              os.pullEvent("speaker_audio_empty")
-            end
-          end
-        else
-          -- New song but not at chunk 0 - we missed the start, catch up
-          print("Receiver: New song detected mid-stream at chunk", msg.chunk_index)
-          expected_song = msg.song_id
-          expected_chunk = msg.chunk_index + 1
-          
-          local buffer = msg.data
-          for _, speaker in ipairs(speakers) do
-            pcall(speaker.playAudio, speaker, buffer, local_volume)
-          end
+        -- Stop current playback
+        for _, s in ipairs(speakers) do
+          pcall(s.stop, s)
         end
       end
+      
+      -- Buffer incoming chunks
+      if msg.chunk_index >= expected_chunk then
+        table.insert(chunk_buffer, {
+          chunk_index = msg.chunk_index,
+          data = msg.data
+        })
+        
+        -- Sort buffer by chunk_index (in case packets arrive out of order)
+        table.sort(chunk_buffer, function(a, b) return a.chunk_index < b.chunk_index end)
+        
+        -- Trim buffer if it gets too large
+        while #chunk_buffer > 5 do
+          table.remove(chunk_buffer, 1)
+          expected_chunk = expected_chunk + 1
+        end
+      end
+    end
+  end
+end
+
+-- ==== PLAYBACK LOOP ====
+local function handlePlayback()
+  while true do
+    -- Check if we have buffered chunks ready to play
+    if #chunk_buffer > 0 and chunk_buffer[1].chunk_index == expected_chunk then
+      local chunk = table.remove(chunk_buffer, 1)
+      expected_chunk = expected_chunk + 1
+      
+      -- Play the chunk
+      local buffer = chunk.data
+      for _, speaker in ipairs(speakers) do
+        while not speaker.playAudio(buffer, local_volume) do
+          os.pullEvent("speaker_audio_empty")
+        end
+      end
+      
+    elseif #chunk_buffer > 0 and chunk_buffer[1].chunk_index > expected_chunk then
+      -- We're behind - skip ahead
+      local missed = chunk_buffer[1].chunk_index - expected_chunk
+      if missed > 0 then
+        print("Receiver: Skipping", missed, "chunk(s) to catch up")
+        expected_chunk = chunk_buffer[1].chunk_index
+      end
+      
+    else
+      -- No chunks ready - wait a bit
+      sleep(0.05)
     end
   end
 end
@@ -249,5 +261,6 @@ print("Receiver: Listening on channel:", RECEIVER_CHANNEL, "(from pacer)")
 print("Receiver: Control channel:", CONTROL_CHANNEL)
 print("Receiver: Volume:", local_volume)
 print("Receiver: Speakers:", #speakers)
+print("Receiver: Buffer size:", BUFFER_SIZE, "chunks")
 
-parallel.waitForAny(handleControl, handleAudio, watchdog)
+parallel.waitForAny(handleControl, handleAudio, handlePlayback, watchdog)

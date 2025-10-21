@@ -352,55 +352,23 @@ local function playbackLoop()
         drawMonitor()
       end
       
-      -- Optional: Play locally for monitoring
+      -- CRITICAL: Use a longer, more conservative delay
+      -- This accounts for wireless transmission time + receiver processing
+      -- DFPWM at 48kHz: 16KB chunk ≈ 0.33 seconds of audio
+      -- Add overhead for network transmission and receiver processing
+      
       if has_local_speaker then
+        -- Play locally for monitoring, but don't use it for timing
         for _, speaker in ipairs(speakers) do
           pcall(speaker.playAudio, speaker, chunk_data.data, chunk_data.volume)
         end
-      end
-      
-      -- CRITICAL: Wait for audio to play before sending next chunk
-      if has_local_speaker then
-        local timeout = os.startTimer(2)
-        while true do
-          local ev, param = os.pullEvent()
-          if ev == "speaker_audio_empty" then
-            os.cancelTimer(timeout)
-            break
-          elseif ev == "timer" and param == timeout then
-            break
-          elseif ev == "pacer_stop_playback" then
-            os.cancelTimer(timeout)
-            return
-          elseif ev == "pacer_check_complete" then
-            -- Handle completion check even during playback
-            os.cancelTimer(timeout)
-            if transmission_complete and buffer_size == 0 then
-              print("Pacer: Playback complete for song", current_song_id)
-              
-              safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
-                type = "playback_complete",
-                song_id = current_song_id,
-                chunks_played = chunks_sent,
-                client_id = my_id
-              })
-              
-              playing = false
-              current_song_id = nil
-              current_song_name = "(none)"
-              chunks_received = 0
-              chunks_sent = 0
-              last_chunk_sent = 0
-              transmission_complete = false
-              drawMonitor()
-              return
-            end
-            break
-          end
-        end
+        
+        -- Use fixed timing that accounts for receiver overhead
+        -- 0.33s audio + 0.05s network/processing overhead
+        sleep(0.38)
       else
-        -- No local speaker - use fixed delay
-        sleep(0.3)
+        -- No local speaker - use slightly longer delay to be safe
+        sleep(0.4)
       end
       
       -- After playing this chunk, check if we're done
