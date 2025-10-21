@@ -1,9 +1,8 @@
--- radioSelector.lua
--- UI client: sends commands to core and displays system state.
+-- radioSelector.lua (FIXED - Updated for new core commands)
+-- UI client: sends commands to core and displays system state
 
--- CONFIG
 local RADIO_CHANNEL = 164
-local CONTROL_CHANNEL = RADIO_CHANNEL + 1
+local CONTROL_CHANNEL = 165
 
 local modem = peripheral.find("modem")
 if not modem then error("Selector: No modem attached") end
@@ -21,6 +20,9 @@ local my_id = gen_client_id("sel")
 local width, height = term.getSize()
 local queue = {}
 local now_playing = nil
+local playing = false
+local looping = 0
+local volume = 1.0
 local server_seq = 0
 local waiting_for_input = false
 
@@ -83,16 +85,65 @@ local function drawNowPlaying()
     term.setTextColor(colors.gray)
     term.write("  (nothing playing)")
   end
+  
+  -- Playing status
+  term.setCursorPos(1, 6)
+  if playing then
+    term.setTextColor(colors.lime)
+    term.write("  [PLAYING]")
+  else
+    term.setTextColor(colors.red)
+    term.write("  [STOPPED]")
+  end
+end
+
+local function drawControls()
+  term.setCursorPos(1, 8)
+  term.setTextColor(colors.cyan)
+  term.write("Controls:")
+  
+  local y = 9
+  
+  -- Volume slider
+  term.setCursorPos(2, y)
+  term.setTextColor(colors.white)
+  term.write("Volume: ")
+  paintutils.drawBox(11, y, 34, y, colors.gray)
+  local width_filled = math.floor(24 * (volume / 3) + 0.5) - 1
+  if width_filled >= 0 then
+    paintutils.drawBox(11, y, 11 + width_filled, y, colors.white)
+  end
+  term.setCursorPos(36, y)
+  term.setTextColor(colors.white)
+  term.write(math.floor(100 * (volume / 3) + 0.5) .. "%")
+  
+  y = y + 1
+  
+  -- Looping status
+  term.setCursorPos(2, y)
+  term.setTextColor(colors.white)
+  term.write("Looping: ")
+  if looping == 0 then
+    term.setTextColor(colors.gray)
+    term.write("Off")
+  elseif looping == 1 then
+    term.setTextColor(colors.lime)
+    term.write("Queue")
+  else
+    term.setTextColor(colors.lime)
+    term.write("Song")
+  end
 end
 
 local function drawQueue()
-  term.setCursorPos(1, 7)
+  local start_y = 12
+  term.setCursorPos(1, start_y)
   term.setTextColor(colors.cyan)
   term.write("Queue (" .. #queue .. " songs):")
   
-  local max_display = math.min(10, height - 10)
+  local max_display = math.min(8, height - start_y - 6)
   for i = 1, math.min(max_display, #queue) do
-    term.setCursorPos(1, 7 + i)
+    term.setCursorPos(1, start_y + i)
     term.setTextColor(colors.white)
     local item = queue[i]
     local name = item.name or "(unknown)"
@@ -103,36 +154,40 @@ local function drawQueue()
   end
   
   if #queue > max_display then
-    term.setCursorPos(1, 7 + max_display + 1)
+    term.setCursorPos(1, start_y + max_display + 1)
     term.setTextColor(colors.gray)
     term.write("  ... and " .. (#queue - max_display) .. " more")
   end
 end
 
 local function drawCommands()
-  local cmd_y = height - 4
+  local cmd_y = height - 5
   term.setCursorPos(1, cmd_y)
   term.setTextColor(colors.lime)
   term.write("Commands:")
   
   term.setCursorPos(1, cmd_y + 1)
   term.setTextColor(colors.white)
-  term.write("  [P]lay Now  [A]dd to Queue  [S]kip")
+  term.write("  [P]lay Now  [A]dd Queue  [N]ext  [S]kip")
   
   term.setCursorPos(1, cmd_y + 2)
-  term.write("  [V]olume    [U]pdate Status [Q]uit")
+  term.write("  [Space]Play/Stop  [L]oop  [V]olume")
+  
+  term.setCursorPos(1, cmd_y + 3)
+  term.write("  [U]pdate Status  [Q]uit")
 end
 
 local function drawUI()
   clearScreen()
   drawHeader()
   drawNowPlaying()
+  drawControls()
   drawQueue()
   drawCommands()
 end
 
 local function promptInput(prompt)
-  local cmd_y = height - 4
+  local cmd_y = height - 5
   term.setCursorPos(1, cmd_y)
   term.setTextColor(colors.black)
   term.setBackgroundColor(colors.yellow)
@@ -152,13 +207,13 @@ local function promptInput(prompt)
 end
 
 local function showMessage(msg, color)
-  local cmd_y = height - 4
+  local cmd_y = height - 5
   term.setCursorPos(1, cmd_y)
   term.setTextColor(color or colors.yellow)
   term.setBackgroundColor(colors.black)
   term.clearLine()
   term.write(" " .. msg)
-  sleep(2)
+  sleep(1.5)
   drawUI()
 end
 
@@ -193,16 +248,57 @@ local function handleAddToQueue()
   end
 end
 
+local function handlePlayNext()
+  local id = promptInput("Enter song ID to play next:")
+  if id and #id > 0 then
+    sendCommand("play_next", {
+      id = id,
+      name = id,
+      artist = "(manual)",
+      volume = 1.0
+    })
+    showMessage("Added to front of queue", colors.lime)
+  else
+    drawUI()
+  end
+end
+
 local function handleSkip()
   sendCommand("skip", nil)
   showMessage("Skipped to next song", colors.lime)
+end
+
+local function handlePlayStop()
+  if playing then
+    sendCommand("stop", nil)
+    showMessage("Stopping playback", colors.orange)
+  else
+    sendCommand("play", nil)
+    showMessage("Starting playback", colors.lime)
+  end
+end
+
+local function handleLoop()
+  looping = (looping + 1) % 3
+  sendCommand("set_looping", { looping = looping })
+  
+  local msg = "Looping: "
+  if looping == 0 then
+    msg = msg .. "Off"
+  elseif looping == 1 then
+    msg = msg .. "Queue"
+  else
+    msg = msg .. "Song"
+  end
+  showMessage(msg, colors.cyan)
 end
 
 local function handleVolume()
   local vol_str = promptInput("Enter volume (0.0 - 3.0):")
   local vol = tonumber(vol_str)
   if vol and vol >= 0 and vol <= 3 then
-    sendCommand("force_set_volume", { volume = vol })
+    volume = vol
+    sendCommand("set_volume", { volume = vol })
     showMessage("Set volume to " .. vol, colors.lime)
   else
     showMessage("Invalid volume", colors.red)
@@ -220,6 +316,9 @@ local function handleModemMessage(channel, msg)
     if msg.type == "status_response" then
       queue = msg.queue or {}
       now_playing = msg.now_playing or nil
+      playing = msg.playing or false
+      looping = msg.looping or 0
+      volume = msg.volume or 1.0
       server_seq = msg.server_seq or server_seq
       if not waiting_for_input then
         drawUI()
@@ -228,6 +327,9 @@ local function handleModemMessage(channel, msg)
     elseif msg.type == "join_ack" and msg.client_id == my_id then
       queue = msg.queue or {}
       now_playing = msg.now_playing or nil
+      playing = msg.playing or false
+      looping = msg.looping or 0
+      volume = msg.volume or 1.0
       print("Selector: Joined network successfully")
       
     elseif msg.type == "now_playing_update" then
@@ -241,6 +343,9 @@ local function handleModemMessage(channel, msg)
       if not waiting_for_input then
         drawUI()
       end
+      
+    elseif msg.type == "heartbeat" then
+      playing = msg.playing or false
       
     elseif msg.type == "network_shutdown" then
       clearScreen()
@@ -273,8 +378,14 @@ local function mainLoop()
         handlePlayNow()
       elseif ch == "a" then
         handleAddToQueue()
+      elseif ch == "n" then
+        handlePlayNext()
       elseif ch == "s" then
         handleSkip()
+      elseif ch == " " then
+        handlePlayStop()
+      elseif ch == "l" then
+        handleLoop()
       elseif ch == "v" then
         handleVolume()
       elseif ch == "u" then

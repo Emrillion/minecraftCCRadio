@@ -1,8 +1,8 @@
--- radioDashboard.lua
--- Displays radio core status on an external monitor with a cleaner UI.
+-- radioDashboard.lua (FIXED)
+-- Displays radio core status on an external monitor
 
 local RADIO_CHANNEL = 164
-local CONTROL_CHANNEL = RADIO_CHANNEL + 1
+local CONTROL_CHANNEL = 165
 
 local modem = peripheral.find("modem")
 if not modem then error("Dashboard: No modem attached") end
@@ -14,7 +14,7 @@ if not monitor then error("Dashboard: No monitor attached") end
 monitor.setTextScale(0.5)
 local mon = monitor
 
--- Generate unique client ID (but try to reuse if we have one saved)
+-- Generate unique client ID
 local function gen_client_id(prefix)
   prefix = prefix or "c"
   return prefix .. "_" .. tostring(math.random(1000,9999)) .. "_" .. tostring(os.time() % 100000)
@@ -108,6 +108,19 @@ local function drawStatus(s)
   
   y = y + 1
   mon.setCursorPos(2, y)
+  mon.setTextColor(colors.white)
+  mon.write("Status: ")
+  if s.playing then
+    mon.setTextColor(colors.lime)
+    mon.write("PLAYING")
+  else
+    mon.setTextColor(colors.red)
+    mon.write("STOPPED")
+  end
+  
+  y = y + 1
+  mon.setCursorPos(2, y)
+  mon.setTextColor(colors.white)
   local np_text = "Now playing: " .. (s.now_playing and s.now_playing.name or "(none)")
   if #np_text > select(1, mon.getSize()) - 2 then
     np_text = np_text:sub(1, select(1, mon.getSize()) - 5) .. "..."
@@ -116,7 +129,24 @@ local function drawStatus(s)
   
   y = y + 1
   mon.setCursorPos(2, y)
+  mon.setTextColor(colors.white)
   mon.write("Queue length: " .. tostring(#s.queue))
+  
+  y = y + 1
+  mon.setCursorPos(2, y)
+  mon.write("Volume: " .. string.format("%.1f", s.volume or 1.0))
+  
+  y = y + 1
+  mon.setCursorPos(2, y)
+  local loop_text = "Looping: "
+  if s.looping == 0 then
+    loop_text = loop_text .. "Off"
+  elseif s.looping == 1 then
+    loop_text = loop_text .. "Queue"
+  else
+    loop_text = loop_text .. "Song"
+  end
+  mon.write(loop_text)
   
   y = y + 1
   mon.setCursorPos(2, y)
@@ -171,7 +201,7 @@ local function mainLoop()
   request_timer = os.startTimer(TIMEOUT)
   
   -- Draw initial UI
-  drawStatus(nil, last_update_time)
+  drawStatus(nil)
   
   while true do
     local event, p1, p2, p3, p4 = os.pullEvent()
@@ -187,7 +217,7 @@ local function mainLoop()
           if request_timer then
             os.cancelTimer(request_timer)
           end
-          drawStatus(last_status, last_update_time)
+          drawStatus(last_status)
           -- Schedule next refresh
           request_timer = os.startTimer(REFRESH_INTERVAL)
           
@@ -195,15 +225,17 @@ local function mainLoop()
           print("Dashboard: Joined network successfully")
           
         elseif msg.type == "heartbeat" then
-          -- Update timestamp without full redraw
-          -- (optional: could update a small section of screen)
+          -- Update playing status without full redraw
+          if last_status then
+            last_status.playing = msg.playing
+          end
           
         elseif msg.type == "now_playing_update" then
           -- Update now playing without waiting for full status
           if last_status then
             last_status.now_playing = msg.now_playing
             last_update_time = os.clock()
-            drawStatus(last_status, last_update_time)
+            drawStatus(last_status)
           end
           
         elseif msg.type == "queue_update" then
@@ -211,7 +243,7 @@ local function mainLoop()
           if last_status then
             last_status.queue = msg.queue
             last_update_time = os.clock()
-            drawStatus(last_status, last_update_time)
+            drawStatus(last_status)
           end
           
         elseif msg.type == "network_shutdown" then
@@ -235,13 +267,13 @@ local function mainLoop()
       if waiting_for_response then
         -- Timeout - no response received
         print("Dashboard: Status request timeout")
-        drawStatus(nil, last_update_time)
+        drawStatus(nil)
         waiting_for_response = false
       end
       
-      -- Redraw to update "seconds ago" counter
+      -- Redraw current status
       if last_status then
-        drawStatus(last_status, last_update_time)
+        drawStatus(last_status)
       end
       
       -- Request new status

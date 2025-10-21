@@ -1,8 +1,8 @@
--- radioReceiver.lua (UPDATED for Pacer system)
--- Now receives from pacer on channel 166 instead of directly from core
+-- radioReceiver.lua (FIXED - Simple buffered playback)
+-- Receives chunks directly from core with minimal buffering
 
-local RECEIVER_CHANNEL = 166  -- Changed! Receive from pacer on this channel
-local CONTROL_CHANNEL = 165  -- Still talk to core on control channel
+local RADIO_CHANNEL = 164
+local CONTROL_CHANNEL = 165
 
 local modem = peripheral.find("modem")
 local decoder = require("cc.audio.dfpwm").make_decoder()
@@ -11,7 +11,7 @@ local speakers = { peripheral.find("speaker") }
 if not modem then error("Receiver: No modem found! Attach a wireless modem.") end
 if #speakers == 0 then error("Receiver: No speakers found! Attach at least one speaker.") end
 
-modem.open(RECEIVER_CHANNEL)
+modem.open(RADIO_CHANNEL)
 modem.open(CONTROL_CHANNEL)
 
 -- ==== CLIENT ID ====
@@ -26,10 +26,9 @@ local my_id = gen_client_id("rx")
 local expected_song = nil
 local expected_chunk = 0
 local local_volume = 1.0
-local accept_global_force = true
 local last_heartbeat = os.clock()
-local chunk_buffer = {}  -- Small local buffer
-local BUFFER_SIZE = 2  -- Keep 2 chunks buffered
+local chunk_queue = {}  -- Queue for received chunks
+local playing_chunk = false
 
 -- ==== UTILITIES ====
 local function safeTransmit(channel, reply, message)
@@ -102,43 +101,33 @@ local function handleControl()
         -- Detect song changes
         if msg.song_id ~= expected_song then
           expected_song = msg.song_id
-          expected_chunk = msg.chunk_index
+          expected_chunk = msg.chunk_index or 0
+          chunk_queue = {}
           
-          -- Stop local playback to avoid mismatch
+          -- Stop speakers to clear old audio
           for _, s in ipairs(speakers) do
             pcall(s.stop, s)
           end
           
-          print("Receiver: Song changed, expecting chunk", expected_chunk)
+          print("Receiver: Song changed, syncing to chunk", expected_chunk)
         end
         
-      elseif msg.type == "ping_request" and msg.client_id == my_id then
-        -- Respond to ping during force refresh
-        safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
-          type = "ping_response",
-          client_id = my_id,
-          seq = msg.seq,
-          timestamp = os.clock()
-        })
-        
       elseif msg.type == "set_volume" then
-        if msg.force or accept_global_force then
+        if msg.force then
           local_volume = msg.volume
           saveConfig()
           print("Receiver: Volume set to", local_volume)
         end
         
-      elseif msg.type == "resync_response" and msg.client_id == my_id then
-        expected_song = msg.song_id
-        expected_chunk = msg.next_chunk_index
-        print("Receiver: Resynced to chunk", expected_chunk)
-        
       elseif msg.type == "now_playing_update" then
-        -- Core notified of song change
         if msg.now_playing then
           print("Receiver: Now playing:", msg.now_playing.name)
         else
           print("Receiver: Playback stopped")
+          chunk_queue = {}
+          for _, s in ipairs(speakers) do
+            pcall(s.stop, s)
+          end
         end
         
       elseif msg.type == "network_shutdown" then
@@ -161,41 +150,47 @@ local function handleControl()
   end
 end
 
--- ==== AUDIO LOOP ====
-local function handleAudio()
+-- ==== AUDIO RECEIVE LOOP ====
+local function handleReceive()
   while true do
     local ev, side, channel, reply, msg, dist = os.pullEvent("modem_message")
     
-    -- NOW listening on RECEIVER_CHANNEL (166) from pacer
-    if channel == RECEIVER_CHANNEL and type(msg) == "table" and msg.type == "audio_chunk" then
+    if channel == RADIO_CHANNEL and type(msg) == "table" and msg.type == "audio_chunk" then
       
       -- Handle song changes
       if msg.song_id ~= expected_song then
-        print("Receiver: New song detected")
+        print("Receiver: New song detected via chunk")
         expected_song = msg.song_id
         expected_chunk = 0
-        chunk_buffer = {}
+        chunk_queue = {}
         
-        -- Stop current playback
         for _, s in ipairs(speakers) do
           pcall(s.stop, s)
         end
       end
       
-      -- Buffer incoming chunks
+      -- Add chunk to queue if it's in sequence or ahead
       if msg.chunk_index >= expected_chunk then
-        table.insert(chunk_buffer, {
+        table.insert(chunk_queue, {
           chunk_index = msg.chunk_index,
-          data = msg.data
+          data = msg.data,
+          volume = msg.volume
         })
         
-        -- Sort buffer by chunk_index (in case packets arrive out of order)
-        table.sort(chunk_buffer, function(a, b) return a.chunk_index < b.chunk_index end)
+        -- Sort queue by chunk index
+        table.sort(chunk_queue, function(a, b) 
+          return a.chunk_index < b.chunk_index 
+        end)
         
-        -- Trim buffer if it gets too large
-        while #chunk_buffer > 5 do
-          table.remove(chunk_buffer, 1)
+        -- Limit queue size to prevent memory issues
+        while #chunk_queue > 10 do
+          table.remove(chunk_queue, 1)
           expected_chunk = expected_chunk + 1
+        end
+        
+        -- Signal playback loop that data is available
+        if not playing_chunk then
+          os.queueEvent("chunk_ready")
         end
       end
     end
@@ -205,30 +200,40 @@ end
 -- ==== PLAYBACK LOOP ====
 local function handlePlayback()
   while true do
-    -- Check if we have buffered chunks ready to play
-    if #chunk_buffer > 0 and chunk_buffer[1].chunk_index == expected_chunk then
-      local chunk = table.remove(chunk_buffer, 1)
-      expected_chunk = expected_chunk + 1
+    -- Wait for chunks to be available
+    if #chunk_queue == 0 or chunk_queue[1].chunk_index > expected_chunk then
+      playing_chunk = false
+      os.pullEvent("chunk_ready")
+    end
+    
+    -- Process next chunk in sequence
+    if #chunk_queue > 0 and chunk_queue[1].chunk_index == expected_chunk then
+      playing_chunk = true
+      local chunk = table.remove(chunk_queue, 1)
       
-      -- Play the chunk
+      -- Play on all speakers
       local buffer = chunk.data
+      local vol = chunk.volume or local_volume
+      
       for _, speaker in ipairs(speakers) do
-        while not speaker.playAudio(buffer, local_volume) do
-          os.pullEvent("speaker_audio_empty")
+        local name = peripheral.getName(speaker)
+        
+        -- Try to play, wait if buffer is full
+        while not speaker.playAudio(buffer, vol) do
+          local ev, speaker_name = os.pullEvent("speaker_audio_empty")
+          if speaker_name == name then
+            break
+          end
         end
       end
       
-    elseif #chunk_buffer > 0 and chunk_buffer[1].chunk_index > expected_chunk then
-      -- We're behind - skip ahead
-      local missed = chunk_buffer[1].chunk_index - expected_chunk
-      if missed > 0 then
-        print("Receiver: Skipping", missed, "chunk(s) to catch up")
-        expected_chunk = chunk_buffer[1].chunk_index
-      end
+      expected_chunk = expected_chunk + 1
       
-    else
-      -- No chunks ready - wait a bit
-      sleep(0.05)
+    elseif #chunk_queue > 0 and chunk_queue[1].chunk_index > expected_chunk then
+      -- We're behind - skip ahead to catch up
+      local skip_count = chunk_queue[1].chunk_index - expected_chunk
+      print("Receiver: Skipping", skip_count, "chunk(s) to catch up")
+      expected_chunk = chunk_queue[1].chunk_index
     end
   end
 end
@@ -236,14 +241,13 @@ end
 -- ==== WATCHDOG ====
 local function watchdog()
   while true do
-    sleep(10)
+    sleep(15)
     local time_since_heartbeat = os.clock() - last_heartbeat
     
-    if time_since_heartbeat > 15 then
+    if time_since_heartbeat > 20 then
       print("Receiver: No heartbeat for", string.format("%.1f", time_since_heartbeat), "seconds")
-      print("Receiver: Connection may be lost")
+      print("Receiver: Attempting to rejoin...")
       
-      -- Try to rejoin
       safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
         type = "join",
         client_id = my_id,
@@ -257,10 +261,9 @@ end
 
 -- ==== MAIN ====
 print("Receiver: Starting audio receiver")
-print("Receiver: Listening on channel:", RECEIVER_CHANNEL, "(from pacer)")
+print("Receiver: Radio channel:", RADIO_CHANNEL)
 print("Receiver: Control channel:", CONTROL_CHANNEL)
 print("Receiver: Volume:", local_volume)
 print("Receiver: Speakers:", #speakers)
-print("Receiver: Buffer size:", BUFFER_SIZE, "chunks")
 
-parallel.waitForAny(handleControl, handleAudio, handlePlayback, watchdog)
+parallel.waitForAny(handleControl, handleReceive, handlePlayback, watchdog)

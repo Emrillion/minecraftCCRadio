@@ -1,9 +1,8 @@
--- radioCore.lua (UPDATED for Pacer system)
--- Core now sends chunks as fast as possible to the pacer
--- Pacer handles throttling to proper playback speed
+-- radioCore.lua (FIXED - Direct transmission with speaker timing)
+-- Core sends chunks directly to receivers using speaker-based pacing
 
-local RADIO_CHANNEL = 164  -- Send to pacer on this channel
-local CONTROL_CHANNEL = 165  -- Control/management channel
+local RADIO_CHANNEL = 164
+local CONTROL_CHANNEL = 165
 local api_base_url = "https://ipod-2to6magyna-uc.a.run.app/"
 local version = "2.1"
 local HEARTBEAT_INTERVAL = 1.0
@@ -17,7 +16,12 @@ if not modem then error("Core: No modem attached") end
 modem.open(RADIO_CHANNEL)
 modem.open(CONTROL_CHANNEL)
 
--- No local speakers needed - pacer handles playback
+-- Core needs at least one speaker for timing synchronization
+local speakers = { peripheral.find("speaker") }
+if #speakers == 0 then
+  error("Core: No speakers found! Core needs at least one speaker for timing.")
+end
+
 local decoder = require("cc.audio.dfpwm").make_decoder()
 
 -- STATE
@@ -27,9 +31,12 @@ local playing_id = nil
 local player_handle = nil
 local is_loading = false
 local is_error = false
+local playing = false
 local chunk_index = 0
 local server_seq = 0
 local clients = {}
+local looping = 0  -- 0=off, 1=queue, 2=song
+local volume = 1.0
 
 -- UTIL
 local function gen_client_id(prefix)
@@ -45,32 +52,31 @@ local function safeTransmit(channel, reply, message)
     print("Core: Transmit error:", err) 
     return false
   end
-  return true
+  return ok
 end
 
 local function broadcastHeartbeat()
   server_seq = server_seq + 1
-  local hb = {
+  safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
     type = "heartbeat",
     song_id = playing_id,
     chunk_index = chunk_index,
     server_seq = server_seq,
-    timestamp = os.clock()
-  }
-  safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, hb)
+    timestamp = os.clock(),
+    playing = playing
+  })
 end
 
-local function broadcastChunk(buffer, volume)
+local function broadcastChunk(buffer, vol)
   server_seq = server_seq + 1
-  local msg = {
+  safeTransmit(RADIO_CHANNEL, RADIO_CHANNEL, {
     type = "audio_chunk",
     song_id = playing_id,
     chunk_index = chunk_index,
     seq = server_seq,
     data = buffer,
-    volume = volume or 1
-  }
-  safeTransmit(RADIO_CHANNEL, RADIO_CHANNEL, msg)
+    volume = vol or volume
+  })
   chunk_index = chunk_index + 1
 end
 
@@ -96,6 +102,9 @@ local function sendStatusResponse(replyChannel, requester)
     clients = buildClientsList(),
     queue = queue,
     now_playing = now_playing,
+    playing = playing,
+    looping = looping,
+    volume = volume,
     server_uptime = os.clock()
   })
 end
@@ -109,20 +118,14 @@ local function pruneStaleClients()
     local age = now - (c.last_seen or now)
     
     if age > CLIENT_TIMEOUT then
-      print("Core: Client", id, "hasn't been seen for", string.format("%.1f", age), "s - pinging...")
-      
-      safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
-        type = "ping_request",
-        client_id = id,
-        seq = now,
-        timestamp = now
-      })
-      
-      c.status = "unresponsive"
+      print("Core: Client", id, "hasn't been seen for", string.format("%.1f", age), "s - removing")
+      clients[id] = nil
     end
   end
   
-  print("Core: Maintenance check - examined", checked, "clients")
+  if checked > 0 then
+    print("Core: Maintenance check - examined", checked, "clients")
+  end
 end
 
 -- QUEUE MANAGEMENT
@@ -138,6 +141,7 @@ local function setNowPlaying(item)
   
   is_loading = true
   is_error = false
+  playing = false
   server_seq = server_seq + 1
 
   if now_playing and now_playing.id then
@@ -154,23 +158,46 @@ local function setNowPlaying(item)
     playing_id = playing_id,
     chunk_index = chunk_index
   })
+  
+  safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+    type = "queue_update",
+    queue = queue
+  })
 end
 
 local function playNextInQueue()
   if #queue > 0 then
+    if looping == 1 and now_playing then
+      -- Loop queue mode - add current song to end
+      table.insert(queue, now_playing)
+    end
+    
     now_playing = queue[1]
     table.remove(queue, 1)
     setNowPlaying(now_playing)
   else
-    now_playing = nil
-    playing_id = nil
-    is_loading = false
-    is_error = false
-    player_handle = nil
-    safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
-      type = "now_playing_update",
+    if looping == 2 and now_playing then
+      -- Loop song mode - replay current song
+      setNowPlaying(now_playing)
+    else
+      -- Stop playing
       now_playing = nil
-    })
+      playing_id = nil
+      is_loading = false
+      is_error = false
+      playing = false
+      player_handle = nil
+      
+      safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+        type = "now_playing_update",
+        now_playing = nil
+      })
+      
+      safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+        type = "queue_update",
+        queue = queue
+      })
+    end
   end
 end
 
@@ -206,42 +233,98 @@ local function controlLoop()
           next_chunk_index = chunk_index,
           server_seq = server_seq,
           queue = queue,
-          now_playing = now_playing
+          now_playing = now_playing,
+          playing = playing,
+          looping = looping,
+          volume = volume
         })
-        
-      elseif message.type == "playback_complete" then
-        -- Pacer finished playing the current song
-        print("Core: Pacer reports playback complete for", message.song_id)
-        if message.song_id == playing_id then
-          print("Core: Moving to next song in queue")
-          -- Don't need to close player_handle - already closed by audioLoop
-          playNextInQueue()
-        end
         
       elseif message.type == "command" then
         local cmd = message.cmd
         print("Core: Command received:", cmd, "from", message.client_id)
         
         if cmd == "add_to_queue" and message.payload then
-          table.insert(queue, message.payload)
+          if message.payload.type == "playlist" and message.payload.playlist_items then
+            -- Add all playlist items
+            for i = 1, #message.payload.playlist_items do
+              table.insert(queue, message.payload.playlist_items[i])
+            end
+          else
+            -- Add single song
+            table.insert(queue, message.payload)
+          end
+          
           safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
             type = "queue_update",
             queue = queue
           })
           
         elseif cmd == "play_now" and message.payload then
-          setNowPlaying(message.payload)
+          -- Stop current playback
+          if playing then
+            for _, speaker in ipairs(speakers) do
+              pcall(speaker.stop, speaker)
+            end
+            playing = false
+          end
+          
+          -- Handle playlist or single song
+          if message.payload.type == "playlist" and message.payload.playlist_items then
+            setNowPlaying(message.payload.playlist_items[1])
+            -- Add remaining songs to front of queue
+            for i = #message.payload.playlist_items, 2, -1 do
+              table.insert(queue, 1, message.payload.playlist_items[i])
+            end
+          else
+            setNowPlaying(message.payload)
+          end
+          
+        elseif cmd == "play_next" and message.payload then
+          -- Handle playlist or single song
+          if message.payload.type == "playlist" and message.payload.playlist_items then
+            -- Insert playlist items at beginning of queue
+            for i = #message.payload.playlist_items, 1, -1 do
+              table.insert(queue, 1, message.payload.playlist_items[i])
+            end
+          else
+            table.insert(queue, 1, message.payload)
+          end
+          
+          safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+            type = "queue_update",
+            queue = queue
+          })
           
         elseif cmd == "skip" then
+          if playing then
+            for _, speaker in ipairs(speakers) do
+              pcall(speaker.stop, speaker)
+            end
+          end
           playNextInQueue()
           
-        elseif cmd == "force_set_volume" and message.payload then
-          local vol = message.payload.volume
-          safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
-            type = "set_volume",
-            volume = vol,
-            force = true
-          })
+        elseif cmd == "play" then
+          if now_playing and not playing then
+            playing = true
+            os.queueEvent("audio_update")
+          elseif #queue > 0 and not now_playing then
+            playNextInQueue()
+            playing = true
+          end
+          
+        elseif cmd == "stop" then
+          playing = false
+          for _, speaker in ipairs(speakers) do
+            pcall(speaker.stop, speaker)
+          end
+          
+        elseif cmd == "set_volume" and message.payload then
+          volume = message.payload.volume
+          print("Core: Volume set to", volume)
+          
+        elseif cmd == "set_looping" and message.payload then
+          looping = message.payload.looping
+          print("Core: Looping set to", looping)
           
         elseif cmd == "request_status" then
           sendStatusResponse(message._reply, message.client_id)
@@ -259,16 +342,7 @@ local function controlLoop()
         if clients[message.client_id] then
           clients[message.client_id].last_seen = os.clock()
           clients[message.client_id].status = "ok"
-          print("Core: Client", message.client_id, "responded to ping")
         end
-        
-      elseif message.type == "resync_request" then
-        safeTransmit(message._reply, CONTROL_CHANNEL, {
-          type = "resync_response",
-          client_id = message.client_id,
-          song_id = playing_id,
-          next_chunk_index = chunk_index
-        })
         
       elseif message.type == "status_request" then
         sendStatusResponse(message._reply, message.client_id)
@@ -304,35 +378,8 @@ local function controlLoop()
           os.reboot()
 
         elseif cmd == "force_refresh" then
-          print("Core: Force refresh - pinging all clients...")
-          
-          local ping_seq = os.clock()
-          local client_count = 0
-          for id, c in pairs(clients) do
-            client_count = client_count + 1
-            safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
-              type = "ping_request",
-              client_id = id,
-              seq = ping_seq,
-              timestamp = os.clock()
-            })
-          end
-          
-          print("Core: Pinged", client_count, "clients, waiting for responses...")
-          sleep(3)
-          
-          local now = os.clock()
-          local removed = 0
-          for id, c in pairs(clients) do
-            local age = now - (c.last_seen or now)
-            if c.status == "unresponsive" or age > 180 then
-              print("Core: Removing unresponsive client:", id)
-              clients[id] = nil
-              removed = removed + 1
-            end
-          end
-          
-          print("Core: Force refresh removed", removed, "unresponsive client(s)")
+          print("Core: Force refresh - clearing stale clients...")
+          pruneStaleClients()
           
           safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
             type = "status_response",
@@ -342,8 +389,6 @@ local function controlLoop()
             server_uptime = os.clock(),
             refreshed = true
           })
-          
-          print("Core: Force refresh complete. Active clients:", #buildClientsList())
         end
       end
     end
@@ -357,12 +402,13 @@ local function httpLoop()
     
     if ev == "http_success" and url and handle then
       player_handle = handle
-      local start = handle.read(4)
+      local start_bytes = handle.read(4)
       chunk_index = 0
       is_loading = false
       is_error = false
+      playing = true
       print("Core: Download ready for", now_playing and now_playing.name or "unknown")
-      print("Core: Starting high-speed chunk transmission to pacer...")
+      os.queueEvent("audio_update")
       
     elseif ev == "http_failure" then
       print("Core: HTTP failure for", url)
@@ -374,43 +420,65 @@ local function httpLoop()
   end
 end
 
--- AUDIO LOOP - Sends chunks as fast as possible, pacer notifies when done
+-- AUDIO LOOP - Uses speaker timing like original system
 local function audioLoop()
-  local chunks_sent = 0
-  local start_time = nil
-  
   while true do
-    if player_handle and now_playing then
-      if chunks_sent == 0 then
-        start_time = os.clock()
-        print("Core: Beginning chunk transmission...")
-      end
+    if playing and player_handle and now_playing then
+      local this_song_id = playing_id
       
-      local chunk = player_handle.read(CHUNK_SIZE)
-      if not chunk then
-        local elapsed = os.clock() - start_time
-        print(string.format("Core: Transmission complete - sent %d chunks in %.2fs", chunks_sent, elapsed))
-        print("Core: Waiting for pacer to finish playback...")
+      while true do
+        local chunk = player_handle.read(CHUNK_SIZE)
         
-        -- Close the handle, but DON'T move to next song yet
-        -- Wait for pacer to send "playback_complete" message
-        player_handle.close()
-        player_handle = nil
-        chunks_sent = 0
+        if not chunk then
+          -- Song finished
+          print("Core: Song finished:", now_playing.name)
+          player_handle.close()
+          player_handle = nil
+          playNextInQueue()
+          break
+        end
         
-        -- Just wait - the controlLoop will handle playback_complete
-        sleep(0.5)
-      else
+        -- Decode chunk
         local buffer = decoder(chunk)
-        broadcastChunk(buffer, now_playing.volume or 1)
-        chunks_sent = chunks_sent + 1
         
-        -- No delay - send as fast as possible!
-        os.sleep(0)
+        -- Broadcast to all receivers
+        broadcastChunk(buffer, volume)
+        
+        -- Play locally on core's speakers for timing synchronization
+        -- This is the KEY to proper timing - we wait for the speaker to be ready
+        local playback_functions = {}
+        for i, speaker in ipairs(speakers) do
+          playback_functions[i] = function()
+            local name = peripheral.getName(speaker)
+            while not speaker.playAudio(buffer, volume) do
+              local ev, speaker_name = os.pullEvent("speaker_audio_empty")
+              if speaker_name == name then
+                break
+              end
+            end
+            
+            -- Wait for this speaker to finish playing this chunk
+            repeat
+              local ev, speaker_name = os.pullEvent("speaker_audio_empty")
+            until speaker_name == name
+          end
+        end
+        
+        -- Wait for all speakers to finish
+        parallel.waitForAll(table.unpack(playback_functions))
+        
+        -- Check if we should stop
+        if not playing or playing_id ~= this_song_id then
+          if player_handle then
+            player_handle.close()
+            player_handle = nil
+          end
+          break
+        end
       end
-    else
-      sleep(0.5)
     end
+    
+    os.pullEvent("audio_update")
   end
 end
 
@@ -432,8 +500,8 @@ end
 
 -- MAIN
 print("Core: Starting radio core server...")
-print("Core: Radio channel:", RADIO_CHANNEL, "(to pacer)")
+print("Core: Radio channel:", RADIO_CHANNEL)
 print("Core: Control channel:", CONTROL_CHANNEL)
-print("Core: NOTE: Requires pacer on channel", RADIO_CHANNEL)
+print("Core: Speakers:", #speakers)
 
 parallel.waitForAny(controlLoop, httpLoop, audioLoop, heartbeatLoop, maintenanceLoop)
