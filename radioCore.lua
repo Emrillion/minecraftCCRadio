@@ -1,17 +1,15 @@
--- radioCore.lua
--- Core authoritative server: maintains queue, downloads audio, decodes, and broadcasts chunks.
--- Place this on your designated server machine. Can run headless (no local speaker required).
+-- radioCore.lua (UPDATED for Pacer system)
+-- Core now sends chunks as fast as possible to the pacer
+-- Pacer handles throttling to proper playback speed
 
--- CONFIG
-local RADIO_CHANNEL = 164
-local CONTROL_CHANNEL = RADIO_CHANNEL + 1
---local api_base_url = "https://ipod-2to6_MAGYNA-uc.a.run.app/"
+local RADIO_CHANNEL = 164  -- Send to pacer on this channel
+local CONTROL_CHANNEL = 165  -- Control/management channel
 local api_base_url = "https://ipod-2to6magyna-uc.a.run.app/"
 local version = "2.1"
 local HEARTBEAT_INTERVAL = 1.0
 local CHUNK_SIZE = 16 * 1024 - 4
-local CLIENT_TIMEOUT = 120 -- seconds before considering a client stale (2 minutes)
-local MAINTENANCE_INTERVAL = 30 -- how often to check for stale clients (30 seconds)
+local CLIENT_TIMEOUT = 120
+local MAINTENANCE_INTERVAL = 30
 
 -- PERIPHERALS
 local modem = peripheral.find("modem")
@@ -19,12 +17,7 @@ if not modem then error("Core: No modem attached") end
 modem.open(RADIO_CHANNEL)
 modem.open(CONTROL_CHANNEL)
 
--- Optional local speaker to preview
-local speakers = { peripheral.find("speaker") }
-local has_local_speakers = (#speakers > 0)
-
--- AUDIO/HTTP
-local http = http
+-- No local speakers needed - pacer handles playback
 local decoder = require("cc.audio.dfpwm").make_decoder()
 
 -- STATE
@@ -34,12 +27,9 @@ local playing_id = nil
 local player_handle = nil
 local is_loading = false
 local is_error = false
-
 local chunk_index = 0
 local server_seq = 0
 local clients = {}
-local shutdown_requested = false
-local restart_requested = false
 
 -- UTIL
 local function gen_client_id(prefix)
@@ -112,7 +102,6 @@ end
 
 local function pruneStaleClients()
   local now = os.clock()
-  local removed = 0
   local checked = 0
   
   for id, c in pairs(clients) do
@@ -120,7 +109,6 @@ local function pruneStaleClients()
     local age = now - (c.last_seen or now)
     
     if age > CLIENT_TIMEOUT then
-      -- Client hasn't been seen in a while - try pinging first
       print("Core: Client", id, "hasn't been seen for", string.format("%.1f", age), "s - pinging...")
       
       safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
@@ -130,14 +118,11 @@ local function pruneStaleClients()
         timestamp = now
       })
       
-      -- Mark as potentially stale, but don't remove yet
-      -- Force refresh will do the actual removal
       c.status = "unresponsive"
     end
   end
   
   print("Core: Maintenance check - examined", checked, "clients")
-  return removed
 end
 
 -- QUEUE MANAGEMENT
@@ -197,7 +182,6 @@ local function controlLoop()
     if channel == CONTROL_CHANNEL and type(message) == "table" then
       message._reply = replyChannel
       
-      -- Update client last_seen timestamp
       if message.client_id and clients[message.client_id] then
         clients[message.client_id].last_seen = os.clock()
       end
@@ -263,7 +247,6 @@ local function controlLoop()
         })
         
       elseif message.type == "ping_response" then
-        -- Client responded to our ping during maintenance or force refresh
         if clients[message.client_id] then
           clients[message.client_id].last_seen = os.clock()
           clients[message.client_id].status = "ok"
@@ -287,7 +270,6 @@ local function controlLoop()
 
         if cmd == "shutdown_network" then
           print("Core: Broadcasting shutdown to all devices...")
-          -- Broadcast multiple times to ensure delivery
           for i = 1, 5 do
             safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
               type = "network_shutdown",
@@ -301,7 +283,6 @@ local function controlLoop()
 
         elseif cmd == "restart_network" then
           print("Core: Broadcasting restart to all devices...")
-          -- Broadcast multiple times to ensure delivery
           for i = 1, 5 do
             safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
               type = "network_restart",
@@ -314,9 +295,8 @@ local function controlLoop()
           os.reboot()
 
         elseif cmd == "force_refresh" then
-          print("Core: Force refresh - pinging all clients and removing unresponsive ones...")
+          print("Core: Force refresh - pinging all clients...")
           
-          -- Ping all clients
           local ping_seq = os.clock()
           local client_count = 0
           for id, c in pairs(clients) do
@@ -330,18 +310,14 @@ local function controlLoop()
           end
           
           print("Core: Pinged", client_count, "clients, waiting for responses...")
-          
-          -- Wait for responses
           sleep(3)
           
-          -- Now remove clients that are marked unresponsive or very old
           local now = os.clock()
           local removed = 0
           for id, c in pairs(clients) do
             local age = now - (c.last_seen or now)
-            -- Remove if status is unresponsive OR if it's been over 3 minutes
             if c.status == "unresponsive" or age > 180 then
-              print("Core: Removing unresponsive client:", id, "(last seen", string.format("%.1f", age), "s ago)")
+              print("Core: Removing unresponsive client:", id)
               clients[id] = nil
               removed = removed + 1
             end
@@ -349,8 +325,6 @@ local function controlLoop()
           
           print("Core: Force refresh removed", removed, "unresponsive client(s)")
           
-          -- Broadcast updated status
-          print("Core: Broadcasting refreshed status...")
           safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
             type = "status_response",
             clients = buildClientsList(),
@@ -379,38 +353,46 @@ local function httpLoop()
       is_loading = false
       is_error = false
       print("Core: Download ready for", now_playing and now_playing.name or "unknown")
+      print("Core: Starting high-speed chunk transmission to pacer...")
       
     elseif ev == "http_failure" then
       print("Core: HTTP failure for", url)
       is_loading = false
       is_error = true
-      -- Auto-skip on error
       sleep(2)
       playNextInQueue()
     end
   end
 end
 
--- AUDIO LOOP
+-- AUDIO LOOP - Now sends chunks as fast as possible
 local function audioLoop()
+  local chunks_sent = 0
+  local start_time = nil
+  
   while true do
     if player_handle and now_playing then
+      if chunks_sent == 0 then
+        start_time = os.clock()
+        print("Core: Beginning chunk transmission...")
+      end
+      
       local chunk = player_handle.read(CHUNK_SIZE)
       if not chunk then
+        local elapsed = os.clock() - start_time
+        print(string.format("Core: Song complete - sent %d chunks in %.2fs", chunks_sent, elapsed))
         print("Core: Song ended:", now_playing.name)
         player_handle.close()
         player_handle = nil
+        chunks_sent = 0
         playNextInQueue()
       else
         local buffer = decoder(chunk)
         broadcastChunk(buffer, now_playing.volume or 1)
-
-        if has_local_speakers then
-          for _, s in ipairs(speakers) do
-            pcall(s.playAudio, s, buffer, now_playing.volume or 1)
-          end
-        end
-
+        chunks_sent = chunks_sent + 1
+        
+        -- No delay - send as fast as possible!
+        -- The pacer will handle throttling
         os.sleep(0)
       end
     else
@@ -437,7 +419,8 @@ end
 
 -- MAIN
 print("Core: Starting radio core server...")
-print("Core: Radio channel:", RADIO_CHANNEL)
+print("Core: Radio channel:", RADIO_CHANNEL, "(to pacer)")
 print("Core: Control channel:", CONTROL_CHANNEL)
+print("Core: NOTE: Requires pacer on channel", RADIO_CHANNEL)
 
 parallel.waitForAny(controlLoop, httpLoop, audioLoop, heartbeatLoop, maintenanceLoop)

@@ -1,8 +1,8 @@
--- radioReceiver.lua
--- Sync-aware receiver that defers to core for authoritative state.
+-- radioReceiver.lua (UPDATED for Pacer system)
+-- Now receives from pacer on channel 166 instead of directly from core
 
-local RADIO_CHANNEL = 164
-local CONTROL_CHANNEL = RADIO_CHANNEL + 1
+local RECEIVER_CHANNEL = 166  -- Changed! Receive from pacer on this channel
+local CONTROL_CHANNEL = 165  -- Still talk to core on control channel
 
 local modem = peripheral.find("modem")
 local decoder = require("cc.audio.dfpwm").make_decoder()
@@ -11,7 +11,7 @@ local speakers = { peripheral.find("speaker") }
 if not modem then error("Receiver: No modem found! Attach a wireless modem.") end
 if #speakers == 0 then error("Receiver: No speakers found! Attach at least one speaker.") end
 
-modem.open(RADIO_CHANNEL)
+modem.open(RECEIVER_CHANNEL)
 modem.open(CONTROL_CHANNEL)
 
 -- ==== CLIENT ID ====
@@ -164,7 +164,8 @@ local function handleAudio()
   while true do
     local ev, side, channel, reply, msg, dist = os.pullEvent("modem_message")
     
-    if channel == RADIO_CHANNEL and type(msg) == "table" and msg.type == "audio_chunk" then
+    -- NOW listening on RECEIVER_CHANNEL (166) from pacer
+    if channel == RECEIVER_CHANNEL and type(msg) == "table" and msg.type == "audio_chunk" then
       -- Check if this is the chunk we're expecting
       if msg.song_id == expected_song and msg.chunk_index == expected_chunk then
         expected_chunk = expected_chunk + 1
@@ -230,6 +231,8 @@ end
 
 -- ==== MAIN ====
 print("Receiver: Starting audio receiver")
+print("Receiver: Listening on channel:", RECEIVER_CHANNEL, "(from pacer)")
+print("Receiver: Control channel:", CONTROL_CHANNEL)
 print("Receiver: Volume:", local_volume)
 print("Receiver: Speakers:", #speakers)
 
