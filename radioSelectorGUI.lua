@@ -363,12 +363,8 @@ function uiLoop()
                 sleep(0.2)
                 in_search_result = false
                 
-                if search_results[clicked_result].type == "playlist" then
-                  sendCommand("play_now", search_results[clicked_result])
-                else
-                  sendCommand("play_now", search_results[clicked_result])
-                end
-                os.queueEvent("audio_update")
+                sendCommand("play_now", search_results[clicked_result])
+                -- Don't queue audio_update - let the response from core handle it
               end
   
               if y == 8 then
@@ -379,7 +375,6 @@ function uiLoop()
                 in_search_result = false
                 
                 sendCommand("play_next", search_results[clicked_result])
-                os.queueEvent("audio_update")
               end
   
               if y == 10 then
@@ -390,7 +385,6 @@ function uiLoop()
                 in_search_result = false
                 
                 sendCommand("add_to_queue", search_results[clicked_result])
-                os.queueEvent("audio_update")
               end
   
               if y == 13 then
