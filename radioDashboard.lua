@@ -184,14 +184,26 @@ local function drawStatus(s)
   mon.write("Last update: " .. os.date("%H:%M:%S"))
 end
 
+-- Keep-alive ping to prevent pruning
+local function sendKeepAlive()
+  safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+    type = "ping",
+    client_id = my_id,
+    seq = os.clock(),
+    timestamp = os.clock()
+  })
+end
+
 -- Main loop with proper event handling
 local function mainLoop()
   local last_status = nil
   local waiting_for_response = false
   local request_timer = nil
+  local keepalive_timer = nil
   local last_update_time = os.clock()
   local REFRESH_INTERVAL = 3
   local TIMEOUT = 5
+  local KEEPALIVE_INTERVAL = 30
   
   -- Initial join and request
   joinNetwork()
@@ -199,6 +211,7 @@ local function mainLoop()
   requestStatus()
   waiting_for_response = true
   request_timer = os.startTimer(TIMEOUT)
+  keepalive_timer = os.startTimer(KEEPALIVE_INTERVAL)
   
   -- Draw initial UI
   drawStatus(nil)
@@ -280,6 +293,11 @@ local function mainLoop()
       requestStatus()
       waiting_for_response = true
       request_timer = os.startTimer(TIMEOUT)
+      
+    elseif event == "timer" and p1 == keepalive_timer then
+      -- Send keep-alive ping
+      sendKeepAlive()
+      keepalive_timer = os.startTimer(KEEPALIVE_INTERVAL)
     end
   end
 end

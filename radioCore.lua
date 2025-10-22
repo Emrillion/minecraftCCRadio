@@ -1,4 +1,4 @@
--- radioCore.lua (FIXED - Direct transmission with speaker timing)
+-- radioCore.lua (FIXED - Client tracking and skip bugs)
 -- Core sends chunks directly to receivers using speaker-based pacing
 
 local RADIO_CHANNEL = 164
@@ -111,20 +111,24 @@ end
 
 local function pruneStaleClients()
   local now = os.clock()
-  local checked = 0
+  local to_remove = {}
   
   for id, c in pairs(clients) do
-    checked = checked + 1
     local age = now - (c.last_seen or now)
     
-    if age > CLIENT_TIMEOUT then
-      print("Core: Client", id, "hasn't been seen for", string.format("%.1f", age), "s - removing")
-      clients[id] = nil
+    -- Only prune if REALLY old (2x timeout) since some clients just listen
+    if age > (CLIENT_TIMEOUT * 2) then
+      print("Core: Client", id, "last seen", string.format("%.1f", age), "s ago - removing")
+      table.insert(to_remove, id)
     end
   end
   
-  if checked > 0 then
-    print("Core: Maintenance check - examined", checked, "clients")
+  for _, id in ipairs(to_remove) do
+    clients[id] = nil
+  end
+  
+  if #to_remove > 0 then
+    print("Core: Maintenance removed", #to_remove, "stale client(s)")
   end
 end
 
@@ -197,6 +201,9 @@ local function playNextInQueue()
         type = "queue_update",
         queue = queue
       })
+      
+      -- Wake up audio loop so it knows to stop
+      os.queueEvent("audio_update")
     end
   end
 end
@@ -209,6 +216,7 @@ local function controlLoop()
     if channel == CONTROL_CHANNEL and type(message) == "table" then
       message._reply = replyChannel
       
+      -- Mark client as seen (even for passive messages)
       if message.client_id and clients[message.client_id] then
         clients[message.client_id].last_seen = os.clock()
       end
@@ -296,11 +304,14 @@ local function controlLoop()
           })
           
         elseif cmd == "skip" then
+          -- Stop current playback
           if playing then
             for _, speaker in ipairs(speakers) do
               pcall(speaker.stop, speaker)
             end
           end
+          
+          -- Move to next song
           playNextInQueue()
           
         elseif cmd == "play" then
@@ -317,6 +328,7 @@ local function controlLoop()
           for _, speaker in ipairs(speakers) do
             pcall(speaker.stop, speaker)
           end
+          os.queueEvent("audio_update")
           
         elseif cmd == "set_volume" and message.payload then
           volume = message.payload.volume
@@ -445,7 +457,6 @@ local function audioLoop()
         broadcastChunk(buffer, volume)
         
         -- Play locally on core's speakers for timing synchronization
-        -- This is the KEY to proper timing - we wait for the speaker to be ready
         local playback_functions = {}
         for i, speaker in ipairs(speakers) do
           playback_functions[i] = function()
