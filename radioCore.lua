@@ -1,4 +1,4 @@
--- radioCore.lua (FIXED - Client tracking and skip bugs)
+-- radioCore.lua (FIXED - Skip bug and receiver tracking)
 -- Core sends chunks directly to receivers using speaker-based pacing
 
 local RADIO_CHANNEL = 164
@@ -145,7 +145,7 @@ local function setNowPlaying(item)
   
   is_loading = true
   is_error = false
-  playing = false
+  playing = false  -- Will be set to true when download completes
   server_seq = server_seq + 1
 
   if now_playing and now_playing.id then
@@ -216,9 +216,11 @@ local function controlLoop()
     if channel == CONTROL_CHANNEL and type(message) == "table" then
       message._reply = replyChannel
       
-      -- Mark client as seen (even for passive messages)
-      if message.client_id and clients[message.client_id] then
-        clients[message.client_id].last_seen = os.clock()
+      -- Mark client as seen (for ALL message types including heartbeat responses)
+      if message.client_id then
+        if clients[message.client_id] then
+          clients[message.client_id].last_seen = os.clock()
+        end
       end
       
       if message.type == "join" then
@@ -268,13 +270,21 @@ local function controlLoop()
           })
           
         elseif cmd == "play_now" and message.payload then
-          -- Stop current playback
-          if playing then
-            for _, speaker in ipairs(speakers) do
-              pcall(speaker.stop, speaker)
-            end
-            playing = false
+          -- Stop current playback completely
+          playing = false
+          if player_handle then
+            pcall(player_handle.close, player_handle)
+            player_handle = nil
           end
+          
+          -- Stop all speakers
+          for _, speaker in ipairs(speakers) do
+            pcall(speaker.stop, speaker)
+          end
+          
+          -- Signal audio loop to stop
+          os.queueEvent("playback_stopped")
+          sleep(0.1)  -- Give audio loop time to notice
           
           -- Handle playlist or single song
           if message.payload.type == "playlist" and message.payload.playlist_items then
@@ -304,14 +314,27 @@ local function controlLoop()
           })
           
         elseif cmd == "skip" then
-          -- Stop current playback
-          if playing then
-            for _, speaker in ipairs(speakers) do
-              pcall(speaker.stop, speaker)
-            end
+          print("Core: Skip command received")
+          
+          -- Stop current playback completely
+          playing = false
+          if player_handle then
+            print("Core: Closing player handle")
+            pcall(player_handle.close, player_handle)
+            player_handle = nil
           end
           
+          -- Stop all speakers
+          for _, speaker in ipairs(speakers) do
+            pcall(speaker.stop, speaker)
+          end
+          
+          -- Signal audio loop to stop current song
+          os.queueEvent("playback_stopped")
+          sleep(0.1)  -- Give audio loop time to notice
+          
           -- Move to next song
+          print("Core: Moving to next song")
           playNextInQueue()
           
         elseif cmd == "play" then
@@ -320,7 +343,6 @@ local function controlLoop()
             os.queueEvent("audio_update")
           elseif #queue > 0 and not now_playing then
             playNextInQueue()
-            playing = true
           end
           
         elseif cmd == "stop" then
@@ -328,7 +350,7 @@ local function controlLoop()
           for _, speaker in ipairs(speakers) do
             pcall(speaker.stop, speaker)
           end
-          os.queueEvent("audio_update")
+          os.queueEvent("playback_stopped")
           
         elseif cmd == "set_volume" and message.payload then
           volume = message.payload.volume
@@ -413,13 +435,14 @@ local function httpLoop()
     local ev, url, handle = os.pullEvent()
     
     if ev == "http_success" and url and handle then
+      print("Core: Download complete, starting playback")
       player_handle = handle
       local start_bytes = handle.read(4)
       chunk_index = 0
       is_loading = false
       is_error = false
       playing = true
-      print("Core: Download ready for", now_playing and now_playing.name or "unknown")
+      print("Core: Set playing=true, signaling audio loop")
       os.queueEvent("audio_update")
       
     elseif ev == "http_failure" then
@@ -435,15 +458,31 @@ end
 -- AUDIO LOOP - Uses speaker timing like original system
 local function audioLoop()
   while true do
+    -- Wait for signal to start playing
+    os.pullEvent("audio_update")
+    
+    print("Core: Audio loop woke up, playing=", playing, "player_handle=", player_handle ~= nil)
+    
     if playing and player_handle and now_playing then
       local this_song_id = playing_id
+      print("Core: Starting playback for song ID:", this_song_id)
       
       while true do
+        -- Check if we should stop first
+        if not playing or playing_id ~= this_song_id then
+          print("Core: Stopping playback (playing=", playing, "id changed=", playing_id ~= this_song_id, ")")
+          if player_handle then
+            pcall(player_handle.close, player_handle)
+            player_handle = nil
+          end
+          break
+        end
+        
         local chunk = player_handle.read(CHUNK_SIZE)
         
         if not chunk then
-          -- Song finished
-          print("Core: Song finished:", now_playing.name)
+          -- Song finished naturally
+          print("Core: Song finished naturally:", now_playing.name)
           player_handle.close()
           player_handle = nil
           playNextInQueue()
@@ -461,35 +500,51 @@ local function audioLoop()
         for i, speaker in ipairs(speakers) do
           playback_functions[i] = function()
             local name = peripheral.getName(speaker)
+            
+            -- Wait for speaker to be ready
             while not speaker.playAudio(buffer, volume) do
-              local ev, speaker_name = os.pullEvent("speaker_audio_empty")
-              if speaker_name == name then
+              -- Check if we should stop while waiting
+              local event_data = {os.pullEvent()}
+              if event_data[1] == "playback_stopped" then
+                return
+              elseif event_data[1] == "speaker_audio_empty" and event_data[2] == name then
                 break
               end
             end
             
             -- Wait for this speaker to finish playing this chunk
             repeat
-              local ev, speaker_name = os.pullEvent("speaker_audio_empty")
-            until speaker_name == name
+              local event_data = {os.pullEvent()}
+              if event_data[1] == "playback_stopped" then
+                return
+              elseif event_data[1] == "speaker_audio_empty" and event_data[2] == name then
+                break
+              end
+            until false
           end
         end
         
-        -- Wait for all speakers to finish
-        parallel.waitForAll(table.unpack(playback_functions))
+        -- Wait for all speakers to finish (or stop event)
+        parallel.waitForAny(
+          function()
+            parallel.waitForAll(table.unpack(playback_functions))
+          end,
+          function()
+            os.pullEvent("playback_stopped")
+          end
+        )
         
-        -- Check if we should stop
+        -- Check again if we should stop
         if not playing or playing_id ~= this_song_id then
+          print("Core: Playback interrupted")
           if player_handle then
-            player_handle.close()
+            pcall(player_handle.close, player_handle)
             player_handle = nil
           end
           break
         end
       end
     end
-    
-    os.pullEvent("audio_update")
   end
 end
 

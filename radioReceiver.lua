@@ -74,6 +74,16 @@ end
 
 loadConfig()
 
+-- Keep-alive function
+local function sendKeepAlive()
+  safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
+    type = "ping",
+    client_id = my_id,
+    seq = os.clock(),
+    timestamp = os.clock()
+  })
+end
+
 -- ==== JOIN NETWORK ====
 print("Receiver: Joining network as", my_id)
 safeTransmit(CONTROL_CHANNEL, CONTROL_CHANNEL, {
@@ -240,8 +250,18 @@ end
 
 -- ==== WATCHDOG ====
 local function watchdog()
+  local keepalive_interval = 30
+  local last_keepalive = os.clock()
+  
   while true do
-    sleep(15)
+    sleep(5)
+    
+    -- Send keep-alive ping periodically
+    if (os.clock() - last_keepalive) > keepalive_interval then
+      sendKeepAlive()
+      last_keepalive = os.clock()
+    end
+    
     local time_since_heartbeat = os.clock() - last_heartbeat
     
     if time_since_heartbeat > 20 then
