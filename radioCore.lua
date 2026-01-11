@@ -1,5 +1,5 @@
--- radioCore.lua (COMPLETE REWRITE - Fixed all sync issues)
--- Simplified state management, proper audio loop coordination
+-- radioCore.lua (STABILITY FIXED v2 - Proper event handling)
+-- Fixed: Audio loop can now respond to state changes while playing
 
 local RADIO_CHANNEL = 164
 local CONTROL_CHANNEL = 165
@@ -30,8 +30,8 @@ local playing_id = nil
 local player_handle = nil
 local is_loading = false
 local is_error = false
-local should_be_playing = false  -- What the user wants
-local actually_playing = false   -- What's actually happening
+local should_be_playing = false
+local actually_playing = false
 local chunk_index = 0
 local server_seq = 0
 local clients = {}
@@ -145,9 +145,6 @@ local function stopPlayback()
     pcall(player_handle.close, player_handle)
     player_handle = nil
   end
-  
-  -- Wake up audio loop
-  os.queueEvent("audio_control")
 end
 
 -- QUEUE MANAGEMENT
@@ -156,7 +153,7 @@ local function setNowPlaying(item, auto_play)
   
   -- Stop current playback first
   stopPlayback()
-  sleep(0.05)  -- Let audio loop settle
+  sleep(0.05)
   
   now_playing = item
   playing_id = item and item.id or nil
@@ -292,12 +289,13 @@ local function controlLoop()
           playNextInQueue()
           
         elseif cmd == "play" then
-          if now_playing then
-            print("Core: Play command - resuming current song")
+          print("Core: Play command - resuming current song")
+          if now_playing and player_handle then
+            print("Core: Setting should_be_playing = true")
             should_be_playing = true
-            if player_handle then
-              os.queueEvent("audio_control")
-            end
+          elseif now_playing and not player_handle then
+            print("Core: Re-downloading current song")
+            setNowPlaying(now_playing, true)
           elseif #queue > 0 then
             print("Core: Play command - starting from queue")
             playNextInQueue()
@@ -393,14 +391,7 @@ local function httpLoop()
       is_loading = false
       is_error = false
       
-      -- If we want to be playing, start now
-      if should_be_playing then
-        print("Core: Starting playback immediately")
-        actually_playing = true
-        os.queueEvent("audio_control")
-      else
-        print("Core: Download complete but not auto-playing")
-      end
+      print("Core: Handle ready, should_be_playing =", should_be_playing)
       
     elseif ev == "http_failure" then
       print("Core: HTTP failure for", url)
@@ -412,28 +403,24 @@ local function httpLoop()
   end
 end
 
--- AUDIO LOOP - Clean and simple
+-- AUDIO LOOP - Uses parallel.waitForAny to handle speaker events without blocking
 local function audioLoop()
   print("Core: Audio loop started")
   
   while true do
-    -- Wait for control signal
-    os.pullEvent("audio_control")
-    
-    print("Core: Audio control signal - should_play:", should_be_playing, "has_handle:", player_handle ~= nil)
-    
-    -- Only play if we should AND we have a handle AND we have a song
+    -- Check if we should start or continue playing
     if should_be_playing and player_handle and now_playing then
       local current_song_id = playing_id
       actually_playing = true
-      print("Core: Starting audio playback for", now_playing.name)
+      print("Core: Starting playback for", now_playing.name)
       
-      -- Read and play chunks until done or interrupted
-      while should_be_playing and player_handle and playing_id == current_song_id do
+      -- Play until told to stop or song ends
+      local stop_requested = false
+      while should_be_playing and player_handle and playing_id == current_song_id and not stop_requested do
         local chunk = player_handle.read(CHUNK_SIZE)
         
         if not chunk then
-          -- Song finished naturally
+          -- Song finished
           print("Core: Song finished:", now_playing.name)
           player_handle.close()
           player_handle = nil
@@ -446,35 +433,105 @@ local function audioLoop()
         local buffer = decoder(chunk)
         broadcastChunk(buffer, volume)
         
-        -- Play locally with speaker timing
-        for _, speaker in ipairs(speakers) do
-          local name = peripheral.getName(speaker)
-          
-          -- Wait for speaker to be ready
-          while not speaker.playAudio(buffer, volume) do
-            os.pullEvent("speaker_audio_empty")
+        -- Play on all speakers with non-blocking approach
+        local speakers_ready = {}
+        for i, speaker in ipairs(speakers) do
+          speakers_ready[i] = false
+        end
+        
+        -- Try to queue on all speakers
+        for i, speaker in ipairs(speakers) do
+          if speaker.playAudio(buffer, volume) then
+            speakers_ready[i] = true
           end
         end
         
-        -- Wait for all speakers to empty (this is the timing sync)
-        for _, speaker in ipairs(speakers) do
-          local name = peripheral.getName(speaker)
-          repeat
-            local ev, speaker_name = os.pullEvent("speaker_audio_empty")
-          until speaker_name == name
+        -- Wait for any speakers that weren't ready
+        while not stop_requested do
+          local all_ready = true
+          for i = 1, #speakers do
+            if not speakers_ready[i] then
+              all_ready = false
+              break
+            end
+          end
+          if all_ready then break end
+          
+          -- Use parallel to check both speaker events AND state changes
+          parallel.waitForAny(
+            function()
+              local ev, speaker_name = os.pullEvent("speaker_audio_empty")
+              -- Try to queue on the speaker that just emptied
+              for i, speaker in ipairs(speakers) do
+                if peripheral.getName(speaker) == speaker_name and not speakers_ready[i] then
+                  if speaker.playAudio(buffer, volume) then
+                    speakers_ready[i] = true
+                  end
+                end
+              end
+            end,
+            function()
+              sleep(0.05)  -- Timeout to check state periodically
+            end
+          )
+          
+          -- Check if we should stop
+          if not should_be_playing or playing_id ~= current_song_id then
+            print("Core: Stop detected during speaker wait")
+            actually_playing = false
+            stop_requested = true
+            break
+          end
         end
         
-        -- Check if we should stop after this chunk
-        if not should_be_playing or playing_id ~= current_song_id then
-          print("Core: Stopping mid-song")
-          actually_playing = false
-          break
+        if stop_requested then break end
+        
+        -- Now wait for all speakers to finish playing this chunk
+        local speakers_done = {}
+        for i = 1, #speakers do
+          speakers_done[i] = false
+        end
+        
+        while not stop_requested do
+          local all_done = true
+          for i = 1, #speakers do
+            if not speakers_done[i] then
+              all_done = false
+              break
+            end
+          end
+          if all_done then break end
+          
+          -- Use parallel to check both speaker events AND state changes
+          parallel.waitForAny(
+            function()
+              local ev, speaker_name = os.pullEvent("speaker_audio_empty")
+              for i, speaker in ipairs(speakers) do
+                if peripheral.getName(speaker) == speaker_name then
+                  speakers_done[i] = true
+                end
+              end
+            end,
+            function()
+              sleep(0.05)  -- Timeout to check state periodically
+            end
+          )
+          
+          -- Check if we should stop
+          if not should_be_playing or playing_id ~= current_song_id then
+            print("Core: Stop detected during playback sync")
+            actually_playing = false
+            stop_requested = true
+            break
+          end
         end
       end
       
       actually_playing = false
     else
+      -- Not playing - wait a bit and check again
       actually_playing = false
+      sleep(0.1)
     end
   end
 end
