@@ -1,0 +1,10 @@
+Update Backlog: (in order of importance)
+
+1. Fix the radio inconsistent skipping/playing/pausing issue. 
+2. Make core "scan" the network when coming online, ensuring that if core was not the first computer started, all devices on the network can still be connected and displayed on dashboard computers.
+3. Ensure that noisy pocket computers work with current system.
+4. Update selector computers to check if they are adjacent to monitors, and if so, display the current queue on them.
+5. Add a locking system + permissions system. Most selector computers are level one and have all their current functionality by default, but they can be partially or fully locked via the system control panel. Partially locked allows selector computers to add new songs to the end of the queue, but nothing else (no skipping, looping, etc.). Fully locked makes them only be able to view the queue. However, there are also some new selector computers that retain all permissions regardless of locking state. (They would be located in the core infrastructure room)
+
+Far future:
+1. Possibly add a region-based system for regional audio playing.
